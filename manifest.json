@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Asistente para Google",
+  "version": "0.1.0",
+  "description": "Iky: asistente conversacional que ayuda a usar Google y a entender páginas externas, sin hacer clic ni escribir.",
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*/*"
+      ],
+      "js": ["content.js"],
+      "css": ["style.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "http://localhost:3000/*"
+  ]
+}
