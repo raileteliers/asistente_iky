@@ -2,19 +2,45 @@
   if (window.__asistenteGoogleCargado) return;
   window.__asistenteGoogleCargado = true;
 
-  const RESPUESTA_RESALTAR = "Debe escribir en la barra grande de búsqueda. Se la marqué en azul.";
-  const RESPUESTA_NO_ENCONTRADA = "No pude encontrar la barra de búsqueda en esta página.";
-  const RESPUESTA_DESCONOCIDO = "Por ahora puedo ayudarle a encontrar dónde escribir su búsqueda en Google.";
-  const RESPUESTA_BARRA_VACIA = "No encontré una búsqueda escrita para iniciar.";
-  const RESPUESTA_EXPLICAR_RESULTADOS = "Estos son los resultados de Google. Los títulos azules son páginas que puede abrir. Debajo de cada título aparece una descripción corta. Le marqué el primer resultado.";
-  const RESPUESTA_NO_EN_RESULTADOS = "Primero haga una búsqueda. Después podré explicarle los resultados.";
+  // HITO S1 — instrumentación de fluidez/latencia. Solo console.debug, detrás
+  // de un flag; no cambia comportamiento ni envía telemetría externa.
+  const AG_DEBUG_PERF = true;
+
+  // Log de performance, suprimido salvo que AG_DEBUG_PERF esté activo.
+  function perfLog(evento, data) {
+    if (!AG_DEBUG_PERF) return;
+    console.debug("[Iky][perf]", evento, data || {});
+  }
+
+  // Marca de tiempo monotónica para medir duraciones.
+  function perfNow() {
+    return performance.now();
+  }
+
+  // Milisegundos transcurridos desde una marca devuelta por perfNow().
+  function perfDuracion(inicio) {
+    return Math.round(performance.now() - inicio);
+  }
+
+  let _perfPreguntaInicio = 0;
+  let _perfTtsInicio = 0;
+
+  const RESPUESTA_RESALTAR = "Le marqué dónde escribir. Escriba ahí.";
+  const RESPUESTA_NO_ENCONTRADA = "No encontré dónde escribir.";
+  const RESPUESTA_DESCONOCIDO = "Le marco dónde escribir en Google.";
+  const RESPUESTA_BARRA_VACIA = "Primero escriba qué quiere buscar.";
+  const RESPUESTA_EXPLICAR_RESULTADOS = "Estos son los resultados. Los títulos azules son páginas. Le marqué el primero.";
+  const RESPUESTA_NO_EN_RESULTADOS = "Primero busque algo en Google. Después le explico los resultados.";
+  // S2: mensajes de cancelación reutilizados en dos puntos del flujo Google
+  // (botón "Cancelar" y rechazo conversacional). Centralizados para no divergir.
+  const CANCEL_BUSQUEDA = "Bien. Presione Enter cuando quiera buscar.";
+  const CANCEL_ABRIR = "Bien. Haga clic en el título marcado.";
   // Mensaje seguro local cuando el cliente detecta términos sensibles
   // (pagos, banca, claves, compras, acciones de riesgo). El backend ya
   // bloquea estos casos; esto es defensa adicional en cliente que además
   // evita gastar cuota del modelo en frases que nunca se ejecutarían.
   const RESPUESTA_FUERA_DE_ALCANCE_LOCAL =
-    "Por seguridad, no puedo ayudarle a hacer pagos, compras, manejar claves o realizar acciones sensibles. " +
-    "Sí puedo ayudarle a buscar información general en Google.";
+    "Por seguridad no puedo ayudar con pagos, compras ni claves.";
 
   // ---- Política de riesgo (defensa en cliente) ----
   // Palabras sueltas: buscar con \b para evitar substrings inocentes
@@ -47,8 +73,10 @@
     "confirmar viaje",
     "aceptar tarifa",
   ];
-  // Prefijos que indican búsqueda directa ("busca X", "quiero buscar X").
-  // Si la consulta del usuario empieza así, ejecutamos sin confirmar.
+  // Prefijos que ejecutan directo (riesgo BAJO, sin confirmar): verbos de
+  // búsqueda y frases de uso/acceso a un sitio. Si la consulta empieza así,
+  // "quiero usar ChatGPT" busca en Google en un paso. Abrir el resultado igual
+  // pide confirmación (ABRIR_PRIMER_RESULTADO sigue siendo MEDIO).
   const VERBOS_BUSQUEDA_DIRECTA = [
     "busca ",
     "buscame ",
@@ -56,6 +84,15 @@
     "quiero buscar ",
     "necesito buscar ",
     "ayudame a buscar ",
+    // Frases de uso/acceso: "quiero usar ChatGPT", "quiero ir a youtube".
+    "quiero usar ",
+    "quiero abrir ",
+    "quiero entrar a ",
+    "quiero ir a ",
+    "necesito usar ",
+    "necesito abrir ",
+    "abre ",
+    "abreme ",
   ];
 
   // ---- Branding / nombre del asistente ----
@@ -78,17 +115,17 @@
     "ikki", "kiki", "vicky",        // variantes vistas en logs reales
   ];
   const AG_SALUDO_VISIBLE =
-    "Hola, me llamo Iky. Mucho gusto. Hoy voy a acompañarle para usar Google paso a paso. Puede hablarme con confianza y yo le iré guiando.";
+    "Hola, soy Iky. Seré su asistente para guiarle paso a paso.";
   const AG_SALUDO_TTS =
-    "Hola, me llamo Iqui. Mucho gusto. Hoy voy a acompañarle para usar Google paso a paso. Puede hablarme con confianza y yo le iré guiando.";
+    "Hola, soy Iqui. Seré su asistente para guiarle paso a paso.";
   // En páginas externas Iky se muestra como chat contextual sobre la
   // página visible. El saludo cambia para no prometer ayuda con Google.
   const AG_SALUDO_PAGINA_EXTERNA =
-    "Estoy viendo esta página con usted. Puede preguntarme qué dice o qué debería mirar. Por seguridad, no haré clic ni escribiré datos.";
+    "Veo esta página. Puedo guiarlo si lo desea.";
   // Respuesta fija cuando el usuario, en página externa, pide buscar en
   // Google. No abrimos pestaña — el usuario decide si vuelve.
   const RESPUESTA_VOLVER_A_GOOGLE =
-    "Para buscar en Google, vuelva a la pestaña de Google. Aquí puedo explicarle esta página.";
+    "Para buscar en Google, vuelva a esa pestaña.";
 
   // ---- Persistencia de chat por pestaña (sessionStorage) ----
   const STORAGE_KEY = "AG_ESTADO_CHAT_V1";
@@ -202,6 +239,30 @@
   let audioElevenLabs = null;
   let audioElevenLabsObjectURL = null;
   let audioElevenLabsReproduciendo = false;
+
+  // Medición de "voz silenciosa": contadores en memoria (no se persisten) para
+  // cuantificar audio de ElevenLabs que se cobra pero no suena. Solo activos con
+  // AG_DEBUG_PERF; el usuario filtra "[Iky][perf] tts_contadores" en la consola y
+  // la última línea muestra el total de la sesión.
+  //   elevenCobrado  : ElevenLabs devolvió audio (= caracteres facturados)
+  //   elevenSono     : ese audio efectivamente se reprodujo (audio.onplay)
+  //   elevenCancelado: se cortó antes de terminar (mensaje encadenado lo pisó)
+  //   autoplayBloqueado: play() rechazado (cobrado pero el navegador no lo dejó sonar)
+  //   webspeech      : se usó el fallback gratuito Web Speech
+  const _ttsStats = {
+    solicitado: 0,
+    elevenCobrado: 0,
+    elevenSono: 0,
+    elevenCancelado: 0,
+    autoplayBloqueado: 0,
+    webspeech: 0,
+    caracteresCobrados: 0,
+  };
+  function _ttsBump(updates) {
+    if (!AG_DEBUG_PERF) return;
+    for (const k in updates) _ttsStats[k] += updates[k];
+    perfLog("tts_contadores", { ..._ttsStats });
+  }
 
   // Ventana conversacional del modo escucha: tras una frase válida iniciada
   // con palabra clave, el usuario puede seguir hablando sin repetir "Iky"
@@ -486,16 +547,26 @@
   async function llamarBackendInterpretar(texto, contexto) {
     // El fetch real lo hace background.js (service worker). Acá solo
     // mensajeamos. El timeout vive allá.
-    const resp = await chrome.runtime.sendMessage({
-      tipo: "INTERPRETAR",
-      texto,
-      contexto,
-    });
+    perfLog("backend_request_inicio", { endpoint: "/interpretar" });
+    const _t = perfNow();
+    let resp;
+    try {
+      resp = await chrome.runtime.sendMessage({
+        tipo: "INTERPRETAR",
+        texto,
+        contexto,
+      });
+    } catch (e) {
+      perfLog("backend_request_error", { endpoint: "/interpretar", duracionMs: perfDuracion(_t), error: (e && e.name) || "Error" });
+      throw e;
+    }
     if (!resp || !resp.ok) {
+      perfLog("backend_request_error", { endpoint: "/interpretar", duracionMs: perfDuracion(_t), error: "no_ok" });
       throw new Error(
         resp && resp.error ? resp.error : "sin respuesta del service worker"
       );
     }
+    perfLog("backend_request_fin", { endpoint: "/interpretar", duracionMs: perfDuracion(_t), ok: true });
     return resp.data;
   }
 
@@ -679,7 +750,7 @@
       const yaPregunta = /\?\s*$/.test(explicacion) || /\bquiere\b/i.test(explicacion);
       const mensajeCombinado = yaPregunta
         ? explicacion
-        : explicacion + " ¿Quiere que abra el primer resultado en una pestaña nueva?";
+        : explicacion + " ¿Lo abro en otra pestaña?";
       agregarMensaje(mensajeCombinado);
       resaltar(resultado.contenedor);
       mostrarAccionAbrirPrimerResultado(resultado);
@@ -687,7 +758,7 @@
       // No detectamos primer resultado (módulos especiales, layout raro):
       // hardcoded porque el mensaje IA pudo asumir que sí lo había.
       agregarMensaje(
-        "Estos son los resultados de Google. Los títulos azules son páginas que puede abrir. Debajo de cada título aparece una descripción corta."
+        "Estos son los resultados. Los títulos azules son páginas que puede abrir."
       );
     }
   }
@@ -741,6 +812,204 @@
     });
     el.classList.add("ag-resaltado");
     el.scrollIntoView({ behavior: "smooth", block: "center" });
+    // Guía visual con cursor virtual (HITO 3). Todo resaltado nace de una
+    // respuesta de Iky (explicar página / sugerir botón / explicar resultados)
+    // o de un comando explícito del usuario en el panel ("¿dónde busco?"), así
+    // que basta con exigir que el panel esté abierto. El overlay es
+    // pointer-events:none: jamás hace clic ni interactúa. Si el panel está
+    // cerrado no guiamos (y limpiamos cualquier cursor que hubiera quedado).
+    if (panelEstaAbierto()) {
+      mostrarCursorGuiaHaciaElemento(el);
+    } else {
+      ocultarCursorGuia();
+    }
+  }
+
+  // ---- Cursor virtual de guía visual (HITO 3) ----
+  //
+  // Muestra un indicador en overlay que viaja desde la zona del panel hacia el
+  // elemento resaltado para señalar dónde mirar / dónde debería pinchar el
+  // usuario. REGLAS DURAS: nunca simula clics/teclas/escritura; el overlay es
+  // pointer-events:none (no bloquea la página); respeta prefers-reduced-motion
+  // (sin animación); modo conservador en páginas sensibles (sin pulso agresivo).
+
+  // Timer único para coordinar el "settle" del scroll y el pulso de llegada.
+  let _cursorGuiaTimer = null;
+
+  function prefiereMenosMovimiento() {
+    return Boolean(
+      window.matchMedia &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    );
+  }
+
+  function cancelarTimersCursor() {
+    if (_cursorGuiaTimer) {
+      clearTimeout(_cursorGuiaTimer);
+      _cursorGuiaTimer = null;
+    }
+  }
+
+  // Punto desde el que "nace" el cursor: idealmente la zona del panel (borde
+  // izquierdo, mirando hacia el contenido de la página). Si el panel no es
+  // medible, caemos a la esquina inferior derecha del viewport.
+  function puntoOrigenCursor() {
+    let x = window.innerWidth - 40;
+    let y = window.innerHeight - 40;
+    if (panel && !panel.classList.contains("ag-oculto")) {
+      const r = panel.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        x = r.left;
+        y = r.top + r.height / 2;
+      }
+    }
+    return { x, y };
+  }
+
+  function posicionarCursorEn(x, y) {
+    cursorGuia.style.transform =
+      "translate(" + Math.round(x) + "px, " + Math.round(y) + "px)";
+  }
+
+  // Coloca y anima el cursor hacia el centro de `el`. opciones.conservador
+  // fuerza el modo sin animación agresiva (también se activa solo en páginas
+  // sensibles). No hace nada si el elemento no es visible.
+  function mostrarCursorGuiaHaciaElemento(el, opciones) {
+    if (!cursorGuia || !el || !esVisible(el)) return;
+    const opts = opciones || {};
+
+    // Re-guiar a un nuevo elemento limpia el estado anterior (timers + clases
+    // de halo) antes de empezar.
+    cancelarTimersCursor();
+    cursorGuia.classList.remove("ag-cursor-pulso", "ag-cursor-estatico");
+
+    const reduce = prefiereMenosMovimiento();
+    const conservador = opts.conservador || esPaginaSensitivaPorUrl();
+    // reduced-motion o página sensible → halo estático (sin pulso); resto →
+    // pulso animado al llegar.
+    const claseHalo = (reduce || conservador) ? "ag-cursor-estatico" : "ag-cursor-pulso";
+
+    const origen = puntoOrigenCursor();
+    cursorGuia.style.display = "block";
+    posicionarCursorEn(origen.x, origen.y);
+
+    const moverADestino = () => {
+      _cursorGuiaTimer = null;
+      // El elemento pudo desaparecer mientras esperábamos el settle del scroll.
+      if (!esVisible(el)) { ocultarCursorGuia(); return; }
+      // Antes de fijar el destino del cursor: si el panel tapa el objetivo,
+      // compactarlo/reubicarlo para que el elemento quede visible.
+      autoCompactarSiTapa(el);
+      const r = el.getBoundingClientRect();
+      posicionarCursorEn(r.left + r.width / 2, r.top + r.height / 2);
+      const activarPulso = () => {
+        _cursorGuiaTimer = null;
+        cursorGuia.classList.add(claseHalo);
+      };
+      if (reduce) {
+        // Sin animación: halo estático inmediato.
+        activarPulso();
+      } else {
+        // Esperamos a que termine el viaje (transición CSS ~950ms) para pulsar.
+        _cursorGuiaTimer = setTimeout(activarPulso, 950);
+      }
+    };
+
+    if (reduce) {
+      // Sin animación de viaje: salto directo al destino tras un settle corto
+      // del scroll. La transición CSS ya está anulada por el media query.
+      _cursorGuiaTimer = setTimeout(moverADestino, 60);
+    } else {
+      // Forzamos reflow para que el cambio de transform al destino se anime
+      // desde el origen, y esperamos a que el scrollIntoView (smooth) acomode
+      // el elemento antes de calcular su posición final.
+      void cursorGuia.offsetWidth;
+      _cursorGuiaTimer = setTimeout(moverADestino, 420);
+    }
+  }
+
+  function ocultarCursorGuia() {
+    if (!cursorGuia) return;
+    cancelarTimersCursor();
+    cursorGuia.classList.remove("ag-cursor-pulso", "ag-cursor-estatico");
+    cursorGuia.style.display = "none";
+  }
+
+  // Punto único de limpieza de TODA la guía visual (resaltado + cursor).
+  // Se invoca al cerrar el panel, reiniciar la ayuda y navegar.
+  function limpiarGuiasVisuales() {
+    document.querySelectorAll(".ag-resaltado").forEach((prev) => {
+      prev.classList.remove("ag-resaltado");
+    });
+    ocultarCursorGuia();
+    // Si el panel se compactó automáticamente para la guía, al terminar ésta
+    // lo devolvemos a su estado completo. Una compactación manual del usuario
+    // se respeta (no la tocamos).
+    if (_compactoAuto) {
+      setCompacto(false);
+      _compactoAuto = false;
+    }
+  }
+
+  // ---- Modo compacto del panel (HITO: responsivo) ----
+  //
+  // El panel completo (bottom-right) puede tapar el elemento que estamos
+  // guiando. setCompacto reduce el panel a una barra (header + estado mic);
+  // autoCompactarSiTapa decide en runtime si compactar/reubicar según haya
+  // intersección entre el rect del panel y el del objetivo.
+
+  let _compactoAuto = false;       // true si la compactación fue automática
+  let _controlManualTs = 0;        // timestamp del último toggle manual
+  const RESPETAR_CONTROL_MANUAL_MS = 8000;
+
+  function setCompacto(compacto) {
+    panel.classList.toggle("ag-panel-compacto", compacto);
+    // La reposición a la izquierda solo tiene sentido estando compacto.
+    if (!compacto) panel.classList.remove("ag-panel-izquierda");
+    btnMinimizar.textContent = compacto ? "Expandir" : "Minimizar";
+    btnMinimizar.setAttribute("aria-label", compacto ? "Expandir el panel" : "Minimizar el panel");
+    btnMinimizar.setAttribute("aria-expanded", compacto ? "false" : "true");
+  }
+
+  function rectsIntersectan(a, b) {
+    return !(a.right <= b.left || a.left >= b.right ||
+             a.bottom <= b.top || a.top >= b.bottom);
+  }
+
+  // Compacta/reubica el panel si tapa al elemento objetivo. Respeta una
+  // expansión manual reciente del usuario. No hace nada si el panel está
+  // oculto o el elemento no tiene caja.
+  function autoCompactarSiTapa(el) {
+    if (!el || !panel || panel.classList.contains("ag-oculto")) return;
+    if (Date.now() - _controlManualTs < RESPETAR_CONTROL_MANUAL_MS) return;
+    const elRect = el.getBoundingClientRect();
+    if (!elRect.width || !elRect.height) return;
+
+    // Medimos con el panel EXPANDIDO y en su posición natural como referencia.
+    // (Toggle de clase + lectura de rect en el mismo tick: sin repintado/flash.)
+    setCompacto(false);
+    if (!rectsIntersectan(panel.getBoundingClientRect(), elRect)) {
+      _compactoAuto = false;
+      return; // expandido no tapa: dejamos el panel completo
+    }
+
+    // Expandido tapa el objetivo: compactamos.
+    setCompacto(true);
+    _compactoAuto = true;
+
+    // En pantallas angostas el panel es full-width: reubicar a la izquierda no
+    // ayuda. La barra compacta abajo ya despeja el objetivo centrado.
+    if (window.innerWidth <= 520) return;
+
+    if (rectsIntersectan(panel.getBoundingClientRect(), elRect)) {
+      // Compacto y aún tapa: probamos reubicar a la izquierda.
+      panel.classList.add("ag-panel-izquierda");
+      if (rectsIntersectan(panel.getBoundingClientRect(), elRect)) {
+        // A la izquierda tampoco despeja (objetivo a la izquierda): no empeorar,
+        // volvemos a la derecha.
+        panel.classList.remove("ag-panel-izquierda");
+      }
+    }
   }
 
   function renderMensaje(texto) {
@@ -756,6 +1025,10 @@
     chat.mensajes.push(texto);
     renderMensaje(texto);
     guardarEstadoChat();
+    perfLog("mensaje_mostrado", {
+      textoLength: texto.length,
+      duracionDesdePreguntaMs: _perfPreguntaInicio ? perfDuracion(_perfPreguntaInicio) : null,
+    });
     // Auto-lectura: salvo opt-out explícito (ej: avisos del propio TTS), si la
     // preferencia está en true y el navegador soporta voz, leemos el nuevo
     // mensaje. leerTexto() cancela cualquier utterance previa, así que dos
@@ -939,6 +1212,19 @@
     };
   }
 
+  // Posición/tamaño del elemento en el viewport. Solo geometría (no PII):
+  // se usa para el ranking local del HITO 2F. El backend la ignora
+  // (sanearPaginaPayload no la lee), así que nunca llega al modelo.
+  function rectDeElemento(el) {
+    const r = el.getBoundingClientRect();
+    return {
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+    };
+  }
+
   function construirResumenPaginaExterna() {
     _elementosResaltablesMap.clear();
 
@@ -976,6 +1262,8 @@
         placeholder: campos.placeholder,
         tag: campos.tag,
         rol: campos.rol,
+        // HITO 2F: geometría para el ranking local (no se envía al modelo).
+        rect: rectDeElemento(el),
       });
       _elementosResaltablesMap.set(idx, el);
       if (elementos.length >= EXTERNA_MAX_ELEMENTOS) break;
@@ -988,6 +1276,8 @@
       encabezados,
       textoVisible,
       elementos,
+      // HITO 2F: tamaño del viewport para heurísticas de posición.
+      viewport: { w: window.innerWidth, h: window.innerHeight },
     };
   }
 
@@ -999,7 +1289,561 @@
     if (!Number.isInteger(idx) || idx < 0) return false;
     const el = _elementosResaltablesMap.get(idx);
     if (!el || !esVisible(el)) return false;
+    perfLog("guia_visual_inicio", { idx });
+    const _tGuia = perfNow();
     resaltar(el);
+    perfLog("guia_visual_fin", {
+      duracionMs: perfDuracion(_tGuia),
+      cursor: panelEstaAbierto(),
+      compacto: panel.classList.contains("ag-panel-compacto"),
+    });
+    return true;
+  }
+
+  // ====================================================================
+  // HITO 2F — Guía visual inteligente en páginas externas
+  //
+  // Para intents comunes (login, continuar, aceptar cookies, cerrar,
+  // menú, buscar) resolvemos de forma DETERMINÍSTICA en el cliente:
+  // clasificamos el intent, rankeamos los elementos del resumen ya
+  // cacheado y, si hay evidencia suficiente, resaltamos sin llamar al
+  // backend. Solo si la confianza es baja caemos a /explicar-pagina,
+  // adjuntando los mejores candidatos para que el modelo elija entre
+  // pocos en vez de adivinar entre 30.
+  //
+  // REGLAS DURAS heredadas: cero interacción (no click, no escritura),
+  // solo elementos visibles, jamás proponemos elementos de pago/banco.
+  // ====================================================================
+
+  const GUIA_INTENT = {
+    LOGIN: "LOGIN",
+    CONTINUAR: "CONTINUAR",
+    ACEPTAR_COOKIES: "ACEPTAR_COOKIES",
+    CERRAR_POPUP: "CERRAR_POPUP",
+    MENU: "MENU",
+    BUSCAR_EN_PAGINA: "BUSCAR_EN_PAGINA",
+  };
+
+  // Umbrales de confianza del ranking (score 0..100).
+  //   >= 60  → alta:  resolver local con mensaje directo.
+  //   40..59 → media: resolver local con mensaje de incertidumbre ("Creo que…").
+  //   < 40   → baja:  fallback a /explicar-pagina (IA) con candidatos.
+  const UMBRAL_GUIA_ALTA = 60;
+  const UMBRAL_GUIA_MEDIA = 40;
+
+  // Definición por intent: frases exactas (+50), keywords (+35) y
+  // equivalentes en inglés (+35). El texto del elemento se normaliza
+  // (minúsculas, sin tildes) antes del match.
+  const GUIA_DEFS = {
+    LOGIN: {
+      frases: ["iniciar sesion", "inicia sesion", "ingresar a mi cuenta"],
+      keywords: ["sesion", "ingresar", "ingresa", "acceder", "entrar"],
+      english: ["sign in", "log in", "login", "signin", "sign-in", "log-in"],
+    },
+    CONTINUAR: {
+      frases: ["continuar sin cuenta", "continuar como invitado"],
+      keywords: ["continuar", "continua", "siguiente", "seguir", "avanzar"],
+      english: ["continue", "next"],
+    },
+    ACEPTAR_COOKIES: {
+      frases: ["aceptar cookies", "aceptar todas", "aceptar todo", "aceptar y cerrar", "acepto las cookies"],
+      keywords: ["aceptar", "acepto", "acepta", "consentir", "consentimiento"],
+      english: ["accept all", "i agree", "accept", "agree", "consent", "allow"],
+    },
+    CERRAR_POPUP: {
+      frases: ["cerrar ventana", "cerrar aviso", "cerrar este mensaje"],
+      keywords: ["cerrar", "cierra", "cerrarlo"],
+      english: ["close", "dismiss"],
+    },
+    MENU: {
+      frases: ["menu de navegacion", "abrir menu"],
+      keywords: ["menu", "navegacion", "hamburguesa", "opciones"],
+      english: ["open menu", "menu", "navigation"],
+    },
+    BUSCAR_EN_PAGINA: {
+      frases: ["barra de busqueda", "caja de busqueda", "cuadro de busqueda"],
+      keywords: ["buscar", "busqueda", "busca"],
+      english: ["search", "find"],
+    },
+  };
+
+  // Mensaje en confianza alta por intent (texto simple, sin inventar).
+  const GUIA_MENSAJE_ALTA = {
+    LOGIN: "Le marqué el botón para iniciar sesión.",
+    CONTINUAR: "Le marqué el botón para continuar.",
+    ACEPTAR_COOKIES: "Le marqué el botón para aceptar cookies.",
+    CERRAR_POPUP: "Le marqué el botón para cerrar.",
+    MENU: "Le marqué el menú.",
+    BUSCAR_EN_PAGINA: "Le marqué la caja para buscar en la página.",
+  };
+  const GUIA_MENSAJE_MEDIA =
+    "Creo que sería este. Si no, avíseme.";
+
+  // Texto de elemento que NUNCA debemos proponer como destino de guía:
+  // aunque el intent sea inocente, no marcamos botones de pago/banco/clave.
+  const GUIA_ELEMENTO_BLOQUEADO =
+    /\b(pagar|pago|pagos|paga|pague|checkout|comprar|compra|compralo|banco|bancaria|bancario|tarjeta|transferir|transferencia|cvv|clave|contrasena|password)\b/;
+
+  function _matchPalabraGuia(hay, palabra) {
+    return new RegExp(
+      "\\b" + palabra.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b"
+    ).test(hay);
+  }
+
+  // Clasificador local de intent de guía. Recibe texto YA normalizado.
+  // Devuelve un GUIA_INTENT o null. No sobre-ingenieriza: cubre lo obvio
+  // en español (y algunos equivalentes en inglés). El primer match gana.
+  function detectarIntentGuiaExterna(t) {
+    if (!t) return null;
+    // LOGIN — excluye "cerrar sesión" / "salir de la cuenta" (eso es logout).
+    if (
+      (/\b(iniciar sesion|inicia sesion)\b/.test(t)
+        || /\b(ingresar|ingreso|ingresa|acceder|accedo|entrar|entro|loguear|logear)\b/.test(t)
+        || /\b(sign in|log in|login|signin)\b/.test(t))
+      && !/cerrar sesion|salir de (la|mi) cuenta/.test(t)
+    ) {
+      return GUIA_INTENT.LOGIN;
+    }
+    // CONTINUAR
+    if (
+      /\b(continuar|continua|continuo|sigo|siguiente|avanzar|proceder)\b/.test(t)
+      || /\bcomo sigo\b/.test(t) || /\bnext\b/.test(t)
+    ) {
+      return GUIA_INTENT.CONTINUAR;
+    }
+    // ACEPTAR_COOKIES
+    if (
+      /\bcookies?\b/.test(t)
+      || /\b(consent|consentimiento|consentir)\b/.test(t)
+      || /\b(aceptar|acepto|acepta)\b/.test(t)
+      || /\b(agree|allow)\b/.test(t)
+    ) {
+      return GUIA_INTENT.ACEPTAR_COOKIES;
+    }
+    // CERRAR_POPUP — excluye "cerrar sesión".
+    if (
+      (/\b(cerrar|cierra|cierro|cerrarlo)\b/.test(t) || /\b(close|dismiss)\b/.test(t)
+        || /quitar (este|el|esta|la) (aviso|mensaje|cartel|popup|ventana|publicidad)/.test(t))
+      && !/cerrar sesion/.test(t)
+    ) {
+      return GUIA_INTENT.CERRAR_POPUP;
+    }
+    // MENU
+    if (/\b(menu|menus|hamburguesa|navegacion)\b/.test(t)) {
+      return GUIA_INTENT.MENU;
+    }
+    // BUSCAR_EN_PAGINA (deliberadamente estrecho: no captura "busca X").
+    // El buscador en sí: "barra/caja/cuadro de búsqueda", "buscar en la página".
+    if (/buscar en (la|esta) pagina|caja de busqueda|barra de busqueda|cuadro de busqueda/.test(t)) {
+      return GUIA_INTENT.BUSCAR_EN_PAGINA;
+    }
+    // "dónde busco" / "dónde puedo buscar": solo marcamos el buscador si la
+    // frase termina ahí o sigue con relleno genérico. Si viene un objeto
+    // específico ("dónde puedo buscar devoluciones / mi pedido"), NO es el
+    // buscador: devolvemos null para que lo resuelva el asistente (backend),
+    // que sí entiende a qué sección se refiere.
+    const mBuscar = t.match(/\bdonde (?:busco|puedo buscar)\b(.*)$/);
+    if (mBuscar) {
+      const resto = mBuscar[1].trim();
+      if (resto === "" || /^(algo|cosas?|informacion|aqui|por aqui|en (la|esta) pagina|en el sitio)\b/.test(resto)) {
+        return GUIA_INTENT.BUSCAR_EN_PAGINA;
+      }
+    }
+    return null;
+  }
+
+  function _textoElementoGuia(el) {
+    return normalizar(
+      [el.texto, el.ariaLabel, el.placeholder].filter(Boolean).join(" ")
+    );
+  }
+
+  // Puntúa UN elemento del resumen para un intent. Sumas simples sobre
+  // 0..100. Devuelve {score, bloqueado, matchTexto, razon}. matchTexto
+  // indica si el texto del elemento tuvo alguna relación con el intent;
+  // sin eso no es candidato (evita proponer botones al azar).
+  function puntuarElementoGuia(intent, el, vw, vh) {
+    const def = GUIA_DEFS[intent];
+    const hay = _textoElementoGuia(el);
+
+    // Seguridad: jamás proponemos pago/banco/clave, matchee o no el intent.
+    if (GUIA_ELEMENTO_BLOQUEADO.test(hay)) {
+      return { score: 0, bloqueado: true, matchTexto: false, razon: "elemento sensible: no se propone" };
+    }
+
+    let score = 0;
+    const razones = [];
+
+    // 1) Match de texto — el nivel más fuerte de los tres (sin doble conteo:
+    //    "iniciar sesion" no suma además por la keyword "sesion").
+    let textoScore = 0;
+    let textoRazon = "";
+    for (const f of def.frases) {
+      if (hay.includes(f) && 50 > textoScore) { textoScore = 50; textoRazon = 'coincide con "' + f + '"'; }
+    }
+    if (textoScore < 50) {
+      for (const k of def.keywords) {
+        if (_matchPalabraGuia(hay, k) && 35 > textoScore) { textoScore = 35; textoRazon = 'menciona "' + k + '"'; }
+      }
+      for (const e of def.english) {
+        if (hay.includes(e) && 35 > textoScore) { textoScore = 35; textoRazon = 'coincide con "' + e + '"'; }
+      }
+    }
+    score += textoScore;
+    if (textoRazon) razones.push(textoRazon);
+
+    // 2) Tipo / rol.
+    const esBoton = el.tipo === "button" || el.rol === "button";
+    const esLink = el.tipo === "link";
+    if (esBoton) { score += 10; razones.push("es botón"); }
+    else if (esLink) { score += 6; razones.push("es enlace"); }
+    if (intent === GUIA_INTENT.BUSCAR_EN_PAGINA
+        && (el.tipo === "input" || el.rol === "searchbox")) {
+      score += 10; razones.push("es caja de texto");
+    }
+
+    // 3) Posición (heurística suave, no rígida).
+    const r = el.rect || {};
+    const x = typeof r.x === "number" ? r.x : 0;
+    const y = typeof r.y === "number" ? r.y : 0;
+    if (intent === GUIA_INTENT.LOGIN && y < 200 && x > vw * 0.55) {
+      score += 6; razones.push("arriba a la derecha");
+    } else if (intent === GUIA_INTENT.ACEPTAR_COOKIES && y > vh * 0.6) {
+      score += 6; razones.push("abajo");
+    } else if (intent === GUIA_INTENT.MENU && y < 200 && x < vw * 0.45) {
+      score += 6; razones.push("arriba a la izquierda");
+    }
+
+    // 4) Tamaño visible razonable (no minúsculo).
+    const w = typeof r.w === "number" ? r.w : 0;
+    const h = typeof r.h === "number" ? r.h : 0;
+    if (w >= 40 && h >= 20) { score += 5; razones.push("tamaño visible"); }
+
+    if (score > 100) score = 100;
+    return { score, bloqueado: false, matchTexto: textoScore > 0, razon: razones.join(", ") };
+  }
+
+  // Rankea los elementos del resumen para un intent. Devuelve un arreglo
+  // {idx, score, razon} ordenado por score desc. El mejor candidato es
+  // `[0]`. Solo incluye elementos con relación de texto al intent y nunca
+  // elementos sensibles (pago/banco).
+  function rankearElementosParaIntent(intent, elementos, viewport) {
+    if (!GUIA_DEFS[intent] || !Array.isArray(elementos)) return [];
+    const vw = (viewport && typeof viewport.w === "number") ? viewport.w : 1000;
+    const vh = (viewport && typeof viewport.h === "number") ? viewport.h : 800;
+    const out = [];
+    for (const el of elementos) {
+      const r = puntuarElementoGuia(intent, el, vw, vh);
+      if (r.bloqueado || !r.matchTexto || r.score <= 0) continue;
+      out.push({ idx: el.idx, score: r.score, razon: r.razon });
+    }
+    out.sort((a, b) => b.score - a.score);
+    return out;
+  }
+
+  // ---- Estado de la última guía local (para "no es ese") ----
+  let _guiaUrlKey = null;
+  let _guiaIntent = null;
+  let _guiaCandidatos = []; // [{idx,score,razon}] del último ranking local
+  let _guiaPos = -1;        // posición dentro de _guiaCandidatos del resaltado actual
+  let _guiaTextoOriginal = null; // pregunta que originó la guía (para reconsultar al backend en "no es ese")
+
+  function _resetGuiaSiCambioUrl() {
+    const k = obtenerUrlKeyActual();
+    if (k !== _guiaUrlKey) {
+      _guiaUrlKey = k;
+      _guiaIntent = null;
+      _guiaCandidatos = [];
+      _guiaPos = -1;
+      _guiaTextoOriginal = null;
+    }
+  }
+
+  // Resuelve una guía localmente (sin backend): marca el mejor candidato,
+  // guarda el ranking para correcciones y registra el turno en memoria.
+  function resolverGuiaLocal(intent, ranking, confianza, textoUsuario) {
+    _guiaIntent = intent;
+    _guiaCandidatos = ranking.slice(0, 5);
+    _guiaPos = 0;
+    _guiaTextoOriginal = textoUsuario;
+    const mejor = _guiaCandidatos[0];
+    const el = _elementosResaltablesMap.get(mejor.idx);
+
+    agregarTurnoChat("usuario", textoUsuario);
+    // Si el elemento ya no es visible, no mentimos: ofrecemos explicar.
+    if (!el || !esVisible(el)) {
+      const fallo =
+        "No pude marcarlo con seguridad. ¿Le explico la página?";
+      agregarMensaje(fallo);
+      agregarTurnoChat("asistente", fallo);
+      _guiaCandidatos = [];
+      _guiaPos = -1;
+      return;
+    }
+    const mensaje = confianza === "alta"
+      ? (GUIA_MENSAJE_ALTA[intent] || "Le marqué lo que pidió.")
+      : GUIA_MENSAJE_MEDIA;
+    agregarMensaje(mensaje);
+    agregarTurnoChat("asistente", mensaje);
+    resaltarElementoExternoPorIdx(mejor.idx);
+    console.debug("[Asistente] guía local 2F →", intent, confianza,
+      "idx:", mejor.idx, "score:", mejor.score, "razón:", mejor.razon);
+  }
+
+  // Detecta una corrección del usuario sobre la última guía. Devuelve una
+  // dirección ("siguiente"|"abajo"|"arriba"|"derecha"|"izquierda") o null.
+  // Las direccionales tienen prioridad sobre "siguiente".
+  function esCorreccionGuia(t) {
+    if (!t) return null;
+    if (/mas abajo|hacia abajo|el de abajo|\babajo\b/.test(t)) return "abajo";
+    if (/mas arriba|hacia arriba|el de arriba|\barriba\b/.test(t)) return "arriba";
+    if (/a la derecha|el de la derecha|\bderecha\b/.test(t)) return "derecha";
+    if (/a la izquierda|el de la izquierda|\bizquierda\b/.test(t)) return "izquierda";
+    if (/no es ese|no es esa|no era ese|ese no|esa no|\botro\b|\botra\b|equivocad/.test(t)) {
+      return "siguiente";
+    }
+    return null;
+  }
+
+  // Elige un candidato en una dirección respecto del resaltado actual.
+  // Usa la geometría EN VIVO (la página pudo scrollear). Devuelve el de
+  // mayor score que cumpla la dirección, o null.
+  function _elegirCandidatoDireccion(direccion) {
+    const actual = _guiaCandidatos[_guiaPos];
+    if (!actual) return null;
+    const elActual = _elementosResaltablesMap.get(actual.idx);
+    if (!elActual) return null;
+    const ra = elActual.getBoundingClientRect();
+    const cax = ra.left + ra.width / 2;
+    const cay = ra.top + ra.height / 2;
+    let mejor = null;
+    let mejorPos = -1;
+    _guiaCandidatos.forEach((c, i) => {
+      if (i === _guiaPos) return;
+      const e = _elementosResaltablesMap.get(c.idx);
+      if (!e || !esVisible(e)) return;
+      const r = e.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      let cumple = false;
+      if (direccion === "abajo") cumple = cy > cay + 4;
+      else if (direccion === "arriba") cumple = cy < cay - 4;
+      else if (direccion === "derecha") cumple = cx > cax + 4;
+      else if (direccion === "izquierda") cumple = cx < cax - 4;
+      if (!cumple) return;
+      if (!mejor || c.score > mejor.score) { mejor = c; mejorPos = i; }
+    });
+    if (mejor) _guiaPos = mejorPos;
+    return mejor;
+  }
+
+  // Maneja la corrección del usuario. "no es ese"/"otro" avanza al siguiente
+  // candidato local; las direccionales eligen el candidato hacia ese lado.
+  // Si se acaban los candidatos locales, reconsulta al asistente (backend) con
+  // la PREGUNTA ORIGINAL para encontrar la sección correcta. Nunca navega ni
+  // hace clic.
+  async function manejarCorreccionGuia(direccion, textoUsuario) {
+    let elegido = null;
+    if (direccion === "siguiente") {
+      if (_guiaPos + 1 < _guiaCandidatos.length) {
+        _guiaPos += 1;
+        elegido = _guiaCandidatos[_guiaPos];
+      }
+    } else {
+      elegido = _elegirCandidatoDireccion(direccion);
+    }
+    // Sin más candidatos locales: en vez de quedarnos pegados, caemos al
+    // asistente con la pregunta original (no con "no es ese") — el backend sí
+    // entiende p.ej. "devoluciones" y puede marcar el enlace correcto. En modo
+    // sensible se mantiene el invariante: flag de seguridad y SIN resaltar.
+    if (!elegido) {
+      const preguntaOriginal = _guiaTextoOriginal || textoUsuario;
+      _guiaCandidatos = []; // cerrar la guía local: el próximo "no es ese" ya no recicla
+      _guiaPos = -1;
+      const pagina = obtenerResumenCacheadoOFresco(false);
+      if (modoPaginaSensible && modoPaginaSensible.esSensible) {
+        await consultarExplicarPagina(preguntaOriginal, { pagina, seguridad: modoPaginaSensible, permitirResaltar: false });
+      } else {
+        await consultarExplicarPagina(preguntaOriginal, { pagina, permitirResaltar: true });
+      }
+      return;
+    }
+    agregarTurnoChat("usuario", textoUsuario);
+    const el = _elementosResaltablesMap.get(elegido.idx);
+    if (!el || !esVisible(el)) {
+      const msg = "No pude marcar esa opción. ¿Le explico la página?";
+      agregarMensaje(msg);
+      agregarTurnoChat("asistente", msg);
+      return;
+    }
+    const msg = "Le marqué otra opción. Si tampoco es, diga “otro”.";
+    agregarMensaje(msg);
+    agregarTurnoChat("asistente", msg);
+    resaltarElementoExternoPorIdx(elegido.idx);
+    console.debug("[Asistente] corrección guía 2F →", direccion,
+      "idx:", elegido.idx, "score:", elegido.score);
+  }
+
+  // ====================================================================
+  // HITO 2G — Modo sensible reforzado en páginas externas
+  //
+  // Detectamos páginas de login/checkout/banca/identidad con señales NO
+  // invasivas (URL + DOM/accesibilidad, SIN leer values). En modo sensible
+  // Iky se vuelve conservador: explica y advierte límites, bloquea guía
+  // hacia login/pago/confirmación, y resalta SOLO elementos no sensibles
+  // (ayuda/contacto/volver/cerrar/menú). La clasificación es 100% local
+  // (no depende del LLM). No toca Google ni /interpretar.
+  // ====================================================================
+
+  // Aviso preventivo (Tarea 3A). Reemplaza el saludo externo en páginas
+  // sensibles y se lee una sola vez al abrir el panel.
+  const AVISO_SENSIBLE =
+    "Puedo explicarle esta página. Por el momento no puedo hacer pagos ni ingresar claves.";
+  // Respuesta cuando el usuario pide guía hacia login/confirmación (Tarea 3B).
+  const RESPUESTA_GUIA_BLOQUEADA_SENSIBLE =
+    "Puedo explicarle esta página. Por el momento no puedo hacer pagos ni ingresar claves.";
+
+  // --- Señales por URL (acotadas) ---
+  const URL_SENALES_FUERTES = [
+    "banco", "bank", "claveunica", "clave-unica",
+    "payment", "checkout", "billing", "tarjeta",
+  ];
+  const URL_SENALES_MEDIAS = [
+    "login", "signin", "signup", "oauth",
+    "/account", "myaccount", "tramite", ".gov", "gob.",
+  ];
+  // --- Señales por DOM ---
+  const SELECTOR_CC_SENSIBLE =
+    'input[autocomplete="cc-number"], input[autocomplete="cc-csc"], input[autocomplete="cc-exp"], input[autocomplete="current-password"], input[autocomplete="new-password"]';
+  const TEXTO_SENSIBLE_ALTO =
+    /\b(cvv|codigo de seguridad|numero de tarjeta|cuenta bancaria|clave unica|datos de (su |la )?tarjeta)\b/;
+  const BOTON_ACCION_SENSIBLE =
+    /\b(iniciar sesion|ingresar|continuar|confirmar|pagar|finalizar compra|checkout|transferir)\b/;
+  // --- Términos de pregunta que NO se guían en modo sensible (Tarea 3B) ---
+  // Más amplio que detectarIntentGuiaExterna: cubre "inicio sesión", "ingreso",
+  // "continuar", "confirmar", "siguiente". (pago/compra/clave ya se bloquean
+  // antes, en manejarPregunta, por contieneTerminosSensibles.)
+  const PREGUNTA_GUIA_PROHIBIDA_SENSIBLE =
+    /\b(iniciar sesion|inicia sesion|inicio (de )?sesion|ingresar|ingreso|acceder|entrar a|log in|sign in|login|continuar|continuo|seguir|siguiente|confirmar|confirmo|finalizar|registrarme|crear (una )?cuenta)\b/;
+  // --- Elementos que SÍ se pueden resaltar en modo sensible (secciones seguras) ---
+  const SECCIONES_SEGURAS =
+    /\b(ayuda|contacto|terminos|condiciones|privacidad|volver|atras|cerrar|salir|menu|navegacion|soporte|faq|preguntas frecuentes|acerca|inicio)\b/;
+  // --- Acciones que NUNCA se resaltan en modo sensible ---
+  const ACCION_PELIGROSA_ELEMENTO =
+    /\b(iniciar sesion|ingresar|acceder|entrar|continuar|confirmar|finalizar|pagar|pago|transferir|comprar|checkout|registrar|crear cuenta|enviar)\b/;
+
+  function _elevarNivel(a, b) {
+    const orden = { BAJO: 0, MEDIO: 1, ALTO: 2 };
+    return orden[b] > orden[a] ? b : a;
+  }
+
+  // Detector de página sensible. Solo señales NO invasivas: URL y DOM/ARIA.
+  // NUNCA lee .value de inputs. Las razones son etiquetas genéricas (jamás
+  // contienen datos del usuario) para poder loguearlas sin filtrar nada.
+  function detectarSensibilidadPaginaExterna() {
+    const razones = [];
+    let nivel = "BAJO";
+
+    // --- URL ---
+    const host = (window.location.hostname || "").toLowerCase();
+    const path = (window.location.pathname || "").toLowerCase();
+    const url = host + " " + path;
+    if (esPaginaSensitivaPorUrl()) { razones.push("url-lista-base"); nivel = _elevarNivel(nivel, "MEDIO"); }
+    if (URL_SENALES_FUERTES.some((s) => url.includes(s))) { razones.push("url-finanzas-identidad"); nivel = _elevarNivel(nivel, "ALTO"); }
+    if (URL_SENALES_MEDIAS.some((s) => url.includes(s))) { razones.push("url-login-cuenta"); nivel = _elevarNivel(nivel, "MEDIO"); }
+
+    // --- DOM (sin leer values) ---
+    try {
+      const pass = document.querySelector('input[type="password"]');
+      if (pass && esVisible(pass)) { razones.push("input-password-visible"); nivel = _elevarNivel(nivel, "ALTO"); }
+      if (document.querySelector(SELECTOR_CC_SENSIBLE)) { razones.push("autocomplete-tarjeta-clave"); nivel = _elevarNivel(nivel, "ALTO"); }
+
+      const textoVis = normalizar(((document.body && document.body.innerText) || "").slice(0, 4000));
+      if (TEXTO_SENSIBLE_ALTO.test(textoVis)) { razones.push("texto-tarjeta-cuenta"); nivel = _elevarNivel(nivel, "ALTO"); }
+
+      // Formulario con varios campos + botón de acción sensible.
+      let maxInputsForm = 0;
+      for (const f of document.querySelectorAll("form")) {
+        if (!esVisible(f)) continue;
+        const n = f.querySelectorAll("input, select").length;
+        if (n > maxInputsForm) maxInputsForm = n;
+      }
+      let botonAccion = false;
+      for (const b of document.querySelectorAll('button, [role="button"]')) {
+        if (!esVisible(b)) continue;
+        const t = normalizar((b.textContent || "") + " " + (b.getAttribute("aria-label") || ""));
+        if (BOTON_ACCION_SENSIBLE.test(t)) { botonAccion = true; break; }
+      }
+      if (botonAccion && maxInputsForm >= 3) { razones.push("form-multicampo-accion"); nivel = _elevarNivel(nivel, "MEDIO"); }
+
+      // iframe de pago (heurística por src/title, sin tocar su contenido).
+      for (const f of document.querySelectorAll("iframe")) {
+        if (!esVisible(f)) continue;
+        const meta = ((f.getAttribute("src") || "") + " " + (f.getAttribute("title") || "")).toLowerCase();
+        if (/payment|checkout|pago|3ds|secure|paypal|webpay|stripe/.test(meta)) {
+          razones.push("iframe-pago"); nivel = _elevarNivel(nivel, "MEDIO"); break;
+        }
+      }
+    } catch (_) {
+      // DOM atípico: no escalamos por un error de consulta.
+    }
+
+    return { esSensible: nivel !== "BAJO", razones, nivel };
+  }
+
+  // Estado de modo sensible en runtime (Tarea 2). Se cachea por urlKey y se
+  // recalcula al cambiar de URL o ante "actualiza/relee".
+  let modoPaginaSensible = { esSensible: false, nivel: "BAJO", razones: [] };
+  let _modoSensibleUrlKey = null;
+
+  function actualizarModoSensible(forzar) {
+    const k = obtenerUrlKeyActual();
+    if (forzar || k !== _modoSensibleUrlKey) {
+      modoPaginaSensible = detectarSensibilidadPaginaExterna();
+      _modoSensibleUrlKey = k;
+      console.debug("[Iky] modo sensible:", modoPaginaSensible);
+    }
+    return modoPaginaSensible;
+  }
+
+  // ¿La pregunta pide guía hacia login/confirmación? (se rechaza en sensible)
+  function esPreguntaGuiaProhibidaSensible(textoNorm) {
+    return PREGUNTA_GUIA_PROHIBIDA_SENSIBLE.test(textoNorm || "");
+  }
+
+  // ¿El intent de guía 2F está permitido en modo sensible? (Tarea 3C)
+  function intentPermitidoEnModoSensible(intent, nivel, pagina, textoNorm) {
+    if (!intent) return true; // sin intent = pregunta de explicación
+    if (intent === GUIA_INTENT.LOGIN || intent === GUIA_INTENT.CONTINUAR) return false;
+    if (intent === GUIA_INTENT.CERRAR_POPUP
+        || intent === GUIA_INTENT.MENU
+        || intent === GUIA_INTENT.BUSCAR_EN_PAGINA) {
+      return true;
+    }
+    if (intent === GUIA_INTENT.ACEPTAR_COOKIES) {
+      if (nivel === "ALTO") return false;          // ALTO: ni cookies
+      return _bannerEsClaramenteDeCookies(pagina, textoNorm); // MEDIO: solo si es banner de cookies
+    }
+    return false;
+  }
+
+  function _bannerEsClaramenteDeCookies(pagina, textoNorm) {
+    if (/cookie|consent/.test(textoNorm || "")) return true;
+    return (pagina && Array.isArray(pagina.elementos) ? pagina.elementos : []).some((e) =>
+      /cookie|consent/.test(normalizar([e.texto, e.ariaLabel].filter(Boolean).join(" ")))
+    );
+  }
+
+  // ¿Es seguro resaltar este elemento en modo sensible? Nunca inputs, nunca
+  // acciones de credencial/dinero/confirmación; en ALTO, solo secciones claras.
+  function esElementoSeguroEnModoSensible(elemento, nivel) {
+    if (!elemento) return false;
+    if (elemento.tipo === "input") return false;
+    const hay = normalizar([elemento.texto, elemento.ariaLabel, elemento.placeholder].filter(Boolean).join(" "));
+    if (!hay) return false;
+    if (GUIA_ELEMENTO_BLOQUEADO.test(hay)) return false;     // pago/banco/clave (regla 2F)
+    if (ACCION_PELIGROSA_ELEMENTO.test(hay)) return false;   // login/continuar/confirmar/pagar…
+    if (nivel === "ALTO") return SECCIONES_SEGURAS.test(hay);
     return true;
   }
 
@@ -1008,23 +1852,138 @@
   // dejar al usuario esperando.
   const EXPLICAR_PAGINA_TIMEOUT_CLIENTE_MS = 6000;
   const RESPUESTA_BACKEND_NO_DISPONIBLE_PAGINA =
-    "Puedo ayudarle a entender esta página, pero ahora no pude conectarme al asistente. Inténtelo de nuevo.";
+    "No puedo responder ahora. Intente de nuevo.";
 
-  async function responderPreguntaSobrePagina(texto) {
-    if (esPaginaSensitivaPorUrl()) {
-      agregarMensaje(
-        "Estoy en una página sensible. Por seguridad, no leeré contenido ni marcaré elementos. " +
-        "Puedo conversar de forma general, pero no haré clic ni escribiré datos."
-      );
+  // Helper único de llamada a /explicar-pagina. Registra el turno del usuario,
+  // arma el mensaje al service worker (con candidatos/seguridad opcionales),
+  // muestra la respuesta saneada y resalta SOLO si se permite. Centraliza el
+  // timeout, los fallbacks y el saneo para los flujos 2F (normal) y 2G (sensible).
+  async function consultarExplicarPagina(texto, opciones) {
+    const opts = opciones || {};
+    agregarTurnoChat("usuario", texto);
+    const historialPrevio = obtenerHistorialReciente().slice(0, -1);
+
+    console.debug("[Asistente] página externa →",
+      "seguimiento:", esPreguntaDeSeguimiento(normalizar(texto)),
+      "historial enviado:", historialPrevio.length,
+      "sensible:", opts.seguridad ? opts.seguridad.nivel : "no",
+      "resumen:", obtenerUrlKeyActual() === ultimoUrlKey ? "cache" : "fresco");
+
+    perfLog("backend_request_inicio", { endpoint: "/explicar-pagina" });
+    const _tBackend = perfNow();
+    let resp;
+    try {
+      resp = await Promise.race([
+        chrome.runtime.sendMessage({
+          tipo: "EXPLICAR_PAGINA",
+          pregunta: texto,
+          historial: historialPrevio,
+          pagina: opts.pagina,
+          // HITO 2F: candidatos sugeridos cuando la guía local no tuvo confianza.
+          candidatos: opts.candidatos || undefined,
+          // HITO 2G: flag de seguridad (refuerza prompt y fuerza idx=null).
+          seguridad: opts.seguridad || undefined,
+        }),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error("timeout")), EXPLICAR_PAGINA_TIMEOUT_CLIENTE_MS)
+        ),
+      ]);
+    } catch (e) {
+      perfLog("backend_request_error", { endpoint: "/explicar-pagina", duracionMs: perfDuracion(_tBackend), error: (e && e.name === "Error" && e.message === "timeout") ? "timeout" : (e && e.name) || "Error" });
+      agregarMensaje(RESPUESTA_BACKEND_NO_DISPONIBLE_PAGINA);
+      return;
+    }
+    if (!resp || !resp.ok || !resp.data) {
+      perfLog("backend_request_error", { endpoint: "/explicar-pagina", duracionMs: perfDuracion(_tBackend), error: "no_ok" });
+      agregarMensaje(RESPUESTA_BACKEND_NO_DISPONIBLE_PAGINA);
+      return;
+    }
+    perfLog("backend_request_fin", { endpoint: "/explicar-pagina", duracionMs: perfDuracion(_tBackend), ok: true });
+
+    const { mensaje, elementoAResaltar } = resp.data;
+    const seguro =
+      sanitizarMensajeIA(mensaje) || "No estoy seguro de lo que aparece en esta página.";
+    agregarMensaje(seguro);
+    agregarTurnoChat("asistente", seguro);
+    // En modo sensible NUNCA resaltamos desde el backend (doble defensa: el
+    // backend ya fuerza idx=null). En flujo normal, resaltamos el idx devuelto.
+    if (opts.permitirResaltar !== false) {
+      resaltarElementoExternoPorIdx(elementoAResaltar);
+    }
+  }
+
+  // HITO 2G — flujo conservador para páginas sensibles. Explica y advierte,
+  // bloquea guía hacia login/confirmación, y resalta SOLO elementos seguros.
+  async function responderEnModoSensible(texto, textoNorm, modo, pagina) {
+    // 1) Guía prohibida (login/ingresar/continuar/confirmar/…): rechazo local.
+    if (esPreguntaGuiaProhibidaSensible(textoNorm)) {
+      agregarMensaje(RESPUESTA_GUIA_BLOQUEADA_SENSIBLE);
+      agregarTurnoChat("usuario", texto);
+      agregarTurnoChat("asistente", RESPUESTA_GUIA_BLOQUEADA_SENSIBLE);
+      console.debug("[Iky] 2G rechazo guía sensible:", modo.nivel);
       return;
     }
 
+    // 2) Intent de guía 2F, validado contra el nivel sensible.
+    const intent = detectarIntentGuiaExterna(textoNorm);
+    if (intent && !intentPermitidoEnModoSensible(intent, modo.nivel, pagina, textoNorm)) {
+      agregarMensaje(RESPUESTA_GUIA_BLOQUEADA_SENSIBLE);
+      agregarTurnoChat("usuario", texto);
+      agregarTurnoChat("asistente", RESPUESTA_GUIA_BLOQUEADA_SENSIBLE);
+      console.debug("[Iky] 2G intent bloqueado:", intent, modo.nivel);
+      return;
+    }
+    if (intent) {
+      // Intent permitido (MENU/CERRAR_POPUP/BUSCAR/cookies-en-MEDIO): rankeamos
+      // pero FILTRAMOS a elementos seguros antes de resaltar.
+      perfLog("ranking_inicio", { intent, elementosCount: pagina.elementos.length });
+      const _tRank = perfNow();
+      const ranking = rankearElementosParaIntent(intent, pagina.elementos, pagina.viewport)
+        .filter((c) => esElementoSeguroEnModoSensible(pagina.elementos[c.idx], modo.nivel));
+      const mejor = ranking[0];
+      const _mejorScore = mejor ? mejor.score : 0;
+      perfLog("ranking_fin", {
+        duracionMs: perfDuracion(_tRank),
+        intent,
+        mejorScore: _mejorScore,
+        candidatosCount: ranking.length,
+        resolucion: _mejorScore >= UMBRAL_GUIA_MEDIA ? "local" : "sin_candidato",
+      });
+      if (mejor && mejor.score >= UMBRAL_GUIA_MEDIA) {
+        resolverGuiaLocal(intent, ranking, mejor.score >= UMBRAL_GUIA_ALTA ? "alta" : "media", texto);
+        console.debug("[Iky] 2G guía segura:", intent, "idx:", mejor.idx, "nivel:", modo.nivel);
+        return;
+      }
+      // Sin candidato seguro suficiente: caemos a explicación (sin resaltar).
+    }
+
+    // 3) Explicación: backend con flag de seguridad. NUNCA resaltamos en sensible.
+    await consultarExplicarPagina(texto, { pagina, seguridad: modo, permitirResaltar: false });
+  }
+
+  async function responderPreguntaSobrePagina(texto) {
     // Asegurar que el historial corresponde a la URL actual. Si el usuario
     // navegó (SPA u otra pestaña), el historial previo se descarta.
     asegurarHistorialPaginaActual();
+    // Misma lógica para el estado de la guía local (HITO 2F): si cambió la
+    // URL, los candidatos previos ya no aplican.
+    _resetGuiaSiCambioUrl();
 
     const textoNorm = normalizar(texto);
     const esActualizar = esComandoActualizar(textoNorm);
+    // HITO 2G — recalcular el modo sensible (cacheado por urlKey; "actualiza"
+    // lo fuerza). Se evalúa ANTES de cualquier guía o llamada al backend.
+    const modo = actualizarModoSensible(esActualizar);
+
+    // HITO 2F — corrección del usuario sobre la última guía local
+    // ("no es ese", "otro", "más abajo"…). Solo aplica si hay una guía
+    // local activa. Se resuelve sin backend. Las correcciones reciclan
+    // candidatos ya vetados (en sensible se vetaron como seguros).
+    const correccion = esCorreccionGuia(textoNorm);
+    if (correccion && _guiaCandidatos.length > 0) {
+      await manejarCorreccionGuia(correccion, texto);
+      return;
+    }
 
     // Comando "actualiza" sin más contenido → respuesta local + invalidar
     // caché del resumen. No llamamos al backend.
@@ -1040,48 +1999,79 @@
 
     // Construir resumen: si esActualizar viene mezclado con otra pregunta,
     // forzamos reconstrucción para este turno. Si no, usamos caché.
+    const _urlKeyResumen = obtenerUrlKeyActual();
+    const _cacheHitResumen = !esActualizar && _urlKeyResumen === ultimoUrlKey && !!ultimoResumenPagina;
+    const _tResumen = perfNow();
+    if (!_cacheHitResumen) perfLog("resumen_pagina_inicio", { urlKey: _urlKeyResumen });
     const pagina = obtenerResumenCacheadoOFresco(esActualizar);
-
-    // Guardar la pregunta del usuario en el historial ANTES de la llamada,
-    // así sobrevive si el backend falla (el usuario ve su turno).
-    agregarTurnoChat("usuario", texto);
-    // El backend recibe los turnos PREVIOS (no el turno actual: ese va como
-    // `pregunta`). Por eso slice(0, -1) sobre el historial reciente.
-    const historialPrevio = obtenerHistorialReciente().slice(0, -1);
-
-    console.debug("[Asistente] página externa →",
-      "seguimiento:", esPreguntaDeSeguimiento(textoNorm),
-      "historial enviado:", historialPrevio.length,
-      "resumen:", obtenerUrlKeyActual() === ultimoUrlKey ? "cache" : "fresco");
-
-    let resp;
-    try {
-      resp = await Promise.race([
-        chrome.runtime.sendMessage({
-          tipo: "EXPLICAR_PAGINA",
-          pregunta: texto,
-          historial: historialPrevio,
-          pagina,
-        }),
-        new Promise((_, rej) =>
-          setTimeout(() => rej(new Error("timeout")), EXPLICAR_PAGINA_TIMEOUT_CLIENTE_MS)
-        ),
-      ]);
-    } catch (_) {
-      agregarMensaje(RESPUESTA_BACKEND_NO_DISPONIBLE_PAGINA);
-      return;
+    if (_cacheHitResumen) {
+      perfLog("resumen_pagina_cache", { urlKey: _urlKeyResumen });
+    } else {
+      perfLog("resumen_pagina_fin", {
+        duracionMs: perfDuracion(_tResumen),
+        textoLength: pagina.textoVisible.length,
+        encabezados: pagina.encabezados.length,
+        elementos: pagina.elementos.length,
+        cache: false,
+      });
     }
-    if (!resp || !resp.ok || !resp.data) {
-      agregarMensaje(RESPUESTA_BACKEND_NO_DISPONIBLE_PAGINA);
+
+    // HITO 2G — en página sensible, ruteo conservador (explica/advierte,
+    // bloquea guía a login/pago/confirmación, resalta solo seguro).
+    if (modo.esSensible) {
+      await responderEnModoSensible(texto, textoNorm, modo, pagina);
       return;
     }
 
-    const { mensaje, elementoAResaltar } = resp.data;
-    const seguro =
-      sanitizarMensajeIA(mensaje) || "No estoy seguro de lo que aparece en esta página.";
-    agregarMensaje(seguro);
-    agregarTurnoChat("asistente", seguro);
-    resaltarElementoExternoPorIdx(elementoAResaltar);
+    // HITO 2F — intent de guía determinístico (login/continuar/cookies/…).
+    // Si hay evidencia suficiente resolvemos local SIN backend; si no,
+    // adjuntamos los mejores candidatos al fallback de IA.
+    let candidatosFallback = null;
+    const intentGuia = detectarIntentGuiaExterna(textoNorm);
+    if (intentGuia) {
+      perfLog("ranking_inicio", { intent: intentGuia, elementosCount: pagina.elementos.length });
+      const _tRank = perfNow();
+      const ranking = rankearElementosParaIntent(intentGuia, pagina.elementos, pagina.viewport);
+      const mejor = ranking[0];
+      const _mejorScore = mejor ? mejor.score : 0;
+      perfLog("ranking_fin", {
+        duracionMs: perfDuracion(_tRank),
+        intent: intentGuia,
+        mejorScore: _mejorScore,
+        candidatosCount: ranking.length,
+        resolucion: _mejorScore >= UMBRAL_GUIA_MEDIA ? "local" : (ranking.length > 0 ? "fallback_ia" : "sin_candidato"),
+      });
+      if (mejor && mejor.score >= UMBRAL_GUIA_ALTA) {
+        resolverGuiaLocal(intentGuia, ranking, "alta", texto);
+        return;
+      }
+      if (mejor && mejor.score >= UMBRAL_GUIA_MEDIA) {
+        resolverGuiaLocal(intentGuia, ranking, "media", texto);
+        return;
+      }
+      // Baja confianza: caemos al backend, pero pasamos los top-5 candidatos
+      // (idx ya válidos) para que el modelo elija entre pocos, no entre 30.
+      if (ranking.length > 0) {
+        candidatosFallback = ranking.slice(0, 5).map((c) => {
+          const el = pagina.elementos[c.idx] || {};
+          return {
+            idx: c.idx,
+            texto: el.texto || el.ariaLabel || el.placeholder || null,
+            razon: c.razon,
+            score: c.score,
+          };
+        });
+      }
+      console.debug("[Asistente] guía 2F baja confianza → fallback IA",
+        "intent:", intentGuia, "candidatos:", candidatosFallback ? candidatosFallback.length : 0);
+    }
+
+    // Fallback / explicación general (no sensible): backend con resaltado normal.
+    await consultarExplicarPagina(texto, {
+      pagina,
+      candidatos: candidatosFallback,
+      permitirResaltar: true,
+    });
   }
 
   // ejecutarIntencion recibe el texto original y el riesgo ya clasificado
@@ -1186,9 +2176,7 @@
       agregarMensaje(RESPUESTA_NO_ENCONTRADA);
       return;
     }
-    agregarMensaje(
-      "Busqué “" + consulta + "” en Google. Le mostraré los resultados."
-    );
+    agregarMensaje("Buscaré “" + consulta + "” en Google.");
     chat.busquedaEnCurso = true;
     chat.ultimaConsulta = consulta;
     guardarEstadoChat();
@@ -1207,7 +2195,7 @@
     }
     chat.ultimaConsulta = consulta;
     agregarMensaje(
-      "Escribí “" + consulta + "” en Google. ¿Quiere que inicie la búsqueda?"
+      "Escribí “" + consulta + "”. ¿Quiere que lo busque?"
     );
     mostrarAccionBuscarAhora(consulta);
   }
@@ -1223,7 +2211,7 @@
     accionesContextuales.appendChild(
       crearBotonContextual("Cancelar", "ag-btn-tenue", () => {
         limpiarAccionesContextuales();
-        agregarMensaje("Está bien. Puede presionar Enter cuando quiera hacer la búsqueda.");
+        agregarMensaje(CANCEL_BUSQUEDA);
       })
     );
   }
@@ -1241,7 +2229,7 @@
     }
     // Avisamos antes de disparar el submit para que el mensaje quede en
     // el DOM antes de que la página navegue a los resultados.
-    agregarMensaje("Listo. Inicié la búsqueda. Ahora Google le mostrará los resultados.");
+    agregarMensaje("Listo. Ahora verá los resultados.");
     // Persiste el flag ANTES del submit: la navegación es instantánea y si no
     // guardamos aquí el próximo content.js no sabrá que viene de una búsqueda
     // iniciada por el asistente.
@@ -1295,7 +2283,7 @@
     accionesContextuales.appendChild(
       crearBotonContextual("Cancelar", "ag-btn-tenue", () => {
         limpiarAccionesContextuales();
-        agregarMensaje("Está bien. Puede hacer clic usted en el título azul marcado si quiere abrirlo.");
+        agregarMensaje(CANCEL_ABRIR);
       })
     );
   }
@@ -1305,7 +2293,7 @@
     const abierto = abrirPrimerResultadoEnNuevaPestana(resultado && resultado.url);
     if (abierto) {
       agregarMensaje(
-        "Listo. Abrí el primer resultado en una pestaña nueva. Puede volver a esta pestaña si necesita más ayuda."
+        "Listo, lo abrí en otra pestaña."
       );
       // Silenciar ESTA pestaña (la original): el usuario probablemente se
       // mueve a la nueva. Si Iky sigue escuchando aquí, contestaría junto
@@ -1314,7 +2302,7 @@
       silenciarEstaPestana();
     } else {
       agregarMensaje(
-        "No pude abrir el primer resultado automáticamente. Puede hacer clic en el título azul marcado."
+        "No pude abrirlo. Haga clic en el título marcado."
       );
     }
   }
@@ -1407,6 +2395,9 @@
     const ACEPTACION = new Set([
       "si", "dale", "ya", "ok", "okay", "okey",
       "hazlo", "hacelo", "hacerlo", "hagalo", "haga",
+      // Afirmaciones chilenas habladas y "sí po"/"ya po" pegados por el motor.
+      "claro", "obvio", "perfecto", "sip", "sipo", "yapo",
+      "escribelo", "escribirlo",
       // Variantes que el motor Web Speech produce cuando transcribe "sí"
       // mal por la cercanía fonética /si/ ↔ /ˈizi/ ↔ /jes/. Vistas en
       // logs reales — "easy" apareció cuando el usuario dijo "sí".
@@ -1425,7 +2416,7 @@
     // "no gracias"). No clasifican por sí solas.
     const NEUTRAL = new Set([
       "por", "favor", "gracias", "ahora", "pues",
-      "mi", "entonces", "nomas",
+      "mi", "entonces", "nomas", "po", "poh", "pue",
     ]);
 
     let aceptCount = 0;
@@ -1439,9 +2430,16 @@
       else if (RECHAZO.has(tok)) rechazoCount++;
       else if (COMANDO_BUSCAR.has(tok)) buscarCount++;
       else if (COMANDO_ABRIR.has(tok)) abrirCount++;
-      else if (NEUTRAL.has(tok)) { /* ignorar */ }
-      else return null; // token desconocido → tratar como nueva intención
+      // NEUTRAL y tokens desconocidos se IGNORAN (antes un desconocido abortaba
+      // con null). Así "sí escríbelo", "ya po", "sí busca eso", "claro que sí"
+      // se entienden como afirmación aunque traigan palabras que no conocemos.
+      // La confirmación crítica de abrir resultado deja de loopear pero sigue
+      // exigiendo una palabra de afirmación/comando (no avanza con frase vacía).
     }
+
+    // Sin ninguna palabra conversacional accionable → nueva intención (como
+    // antes). Evita confirmar por accidente una frase arbitraria.
+    if (aceptCount + rechazoCount + buscarCount + abrirCount === 0) return null;
 
     // Prioridad: rechazo > aceptación > comando. Si hay cualquier "no"
     // explícito, gana rechazo aunque haya otras palabras.
@@ -1459,11 +2457,11 @@
     switch (accion.tipo) {
       case "BUSCAR_AHORA":
         limpiarAccionesContextuales();
-        agregarMensaje("Está bien. Puede presionar Enter cuando quiera hacer la búsqueda.");
+        agregarMensaje(CANCEL_BUSQUEDA);
         return;
       case "ABRIR_PRIMER_RESULTADO":
         limpiarAccionesContextuales();
-        agregarMensaje("Está bien. Puede hacer clic usted en el título azul marcado si quiere abrirlo.");
+        agregarMensaje(CANCEL_ABRIR);
         return;
     }
   }
@@ -1587,6 +2585,8 @@
   // silencioso (lo decide leerTexto).
   async function leerTextoElevenLabs(texto) {
     if (!texto) return false;
+    perfLog("tts_backend_inicio", { proveedor: "elevenlabs" });
+    const _tTtsBackend = perfNow();
     let resp;
     try {
       resp = await Promise.race([
@@ -1596,11 +2596,18 @@
         ),
       ]);
     } catch (e) {
+      perfLog("tts_backend_fin", { proveedor: "elevenlabs", duracionMs: perfDuracion(_tTtsBackend), ok: false, error: "timeout" });
       return false;
     }
-    if (!resp || !resp.ok || !resp.data || !resp.data.ok) return false;
+    if (!resp || !resp.ok || !resp.data || !resp.data.ok) {
+      perfLog("tts_backend_fin", { proveedor: "elevenlabs", duracionMs: perfDuracion(_tTtsBackend), ok: false });
+      return false;
+    }
+    perfLog("tts_backend_fin", { proveedor: "elevenlabs", duracionMs: perfDuracion(_tTtsBackend), ok: true });
     const { audioBase64, contentType } = resp.data;
     if (typeof audioBase64 !== "string" || !audioBase64) return false;
+    // ElevenLabs devolvió audio => ya facturó estos caracteres, suene o no.
+    _ttsBump({ elevenCobrado: 1, caracteresCobrados: texto.length });
 
     let url;
     let audio;
@@ -1625,6 +2632,8 @@
 
     audio.onplay = () => {
       audioElevenLabsReproduciendo = true;
+      perfLog("tts_audio_play", { proveedor: "elevenlabs", duracionDesdeSolicitudMs: _perfTtsInicio ? perfDuracion(_perfTtsInicio) : null });
+      _ttsBump({ elevenSono: 1 });
       actualizarBotonVoz();
     };
     // cleanup unifica onended/onerror/onpause: marca no-reproduciendo,
@@ -1644,7 +2653,7 @@
       if (modoEscuchaActivado) reanudarModoEscuchaSiCorresponde();
     };
     audio.onended = cleanup;
-    audio.onpause = () => { if (!audio.ended) cleanup(); };
+    audio.onpause = () => { if (!audio.ended) { _ttsBump({ elevenCancelado: 1 }); cleanup(); } };
     audio.onerror = cleanup;
 
     try {
@@ -1652,7 +2661,8 @@
       return true;
     } catch (e) {
       // play() puede rechazar por bloqueo de autoplay si no hubo gesto
-      // de usuario. cleanup ya revoca la URL.
+      // de usuario. cleanup ya revoca la URL. Audio cobrado que no sonó.
+      _ttsBump({ autoplayBloqueado: 1 });
       cleanup();
       return false;
     }
@@ -1672,7 +2682,11 @@
       u.rate = 0.9;
       u.pitch = 1;
       u.volume = 1;
-      u.onstart = () => actualizarBotonVoz();
+      u.onstart = () => {
+        perfLog("tts_audio_play", { proveedor: "webspeech", duracionDesdeSolicitudMs: _perfTtsInicio ? perfDuracion(_perfTtsInicio) : null });
+        _ttsBump({ webspeech: 1 });
+        actualizarBotonVoz();
+      };
       u.onend = () => {
         actualizarBotonVoz();
         // Reanudar modo escucha si estaba esperando que termináramos.
@@ -1700,9 +2714,13 @@
   // leerTextoWebSpeech con {leer:false} para no entrar en loop).
   async function leerTexto(texto) {
     if (!texto) return;
+    _perfTtsInicio = perfNow();
+    perfLog("tts_inicio", { proveedorPreferido: "elevenlabs", textoLength: texto.length });
+    _ttsBump({ solicitado: 1 });
     detenerLectura();
     const ok = await leerTextoElevenLabs(texto);
     if (ok) return;
+    perfLog("tts_fallback", { desde: "elevenlabs", hacia: "webspeech" });
     leerTextoWebSpeech(texto);
   }
 
@@ -2180,13 +3198,15 @@
     // Limpiar botones contextuales (Hacerlo por mí, Buscar ahora, Sí/Cancelar,
     // Abrir primer resultado) sin tocar el historial del chat.
     limpiarAccionesContextuales();
+    // Limpiar la guía visual (resaltado + cursor) al reiniciar.
+    limpiarGuiasVisuales();
     // Limpiar timer de error visual si quedó pendiente.
     if (estadoMicErrorTimer) {
       clearTimeout(estadoMicErrorTimer);
       estadoMicErrorTimer = null;
     }
     actualizarEstadoMic();
-    agregarMensaje("Listo. Empecemos de nuevo. ¿En qué le ayudo?");
+    agregarMensaje("Listo. ¿En qué le ayudo?");
   }
 
   // ---- Construcción del DOM ----
@@ -2199,15 +3219,37 @@
   panel.id = "ag-panel";
   panel.classList.add("ag-oculto");
 
+  // Header: título + botón Minimizar/Expandir. El botón debe seguir visible en
+  // modo compacto, por eso vive en el header (que nunca se oculta).
+  const header = document.createElement("div");
+  header.id = "ag-header";
   const titulo = document.createElement("h2");
   titulo.textContent = AG_NOMBRE_ASISTENTE;
-  panel.appendChild(titulo);
+  header.appendChild(titulo);
+  const btnMinimizar = document.createElement("button");
+  btnMinimizar.id = "ag-minimizar";
+  btnMinimizar.type = "button";
+  btnMinimizar.textContent = "Minimizar";
+  btnMinimizar.setAttribute("aria-label", "Minimizar el panel");
+  btnMinimizar.setAttribute("aria-expanded", "true");
+  header.appendChild(btnMinimizar);
+  panel.appendChild(header);
 
   const saludo = document.createElement("p");
   saludo.className = "ag-saludo";
   // El saludo cambia según contexto: en Google es presentación; en página
   // externa es un disclaimer corto de qué puede y qué NO puede hacer.
-  saludo.textContent = esPaginaExterna() ? AG_SALUDO_PAGINA_EXTERNA : AG_SALUDO_VISIBLE;
+  // HITO 2G: en página externa SENSIBLE, el saludo es el aviso preventivo
+  // reforzado (se calcula una vez al cargar). Así el límite se anuncia y se
+  // lee por TTS una sola vez, sin competir con respuestas posteriores.
+  if (esPaginaExterna()) {
+    actualizarModoSensible(true); // calcula + loguea modoPaginaSensible
+    saludo.textContent = modoPaginaSensible.esSensible
+      ? AVISO_SENSIBLE
+      : AG_SALUDO_PAGINA_EXTERNA;
+  } else {
+    saludo.textContent = AG_SALUDO_VISIBLE;
+  }
   panel.appendChild(saludo);
 
   const mensajes = document.createElement("div");
@@ -2285,6 +3327,29 @@
   document.body.appendChild(boton);
   document.body.appendChild(panel);
 
+  // Cursor virtual de guía (HITO 3). Se construye con createElement (sin
+  // innerHTML) y vive oculto hasta que resaltar() lo active. pointer-events
+  // none vía CSS: no bloquea ni recibe clics. aria-hidden porque es puramente
+  // decorativo (el mensaje hablado/escrito ya describe a dónde mirar).
+  const cursorGuia = document.createElement("div");
+  cursorGuia.id = "ag-cursor";
+  cursorGuia.setAttribute("aria-hidden", "true");
+  const cursorHalo = document.createElement("div");
+  cursorHalo.className = "ag-cursor-halo";
+  const cursorPunto = document.createElement("div");
+  cursorPunto.className = "ag-cursor-punto";
+  cursorGuia.appendChild(cursorHalo);
+  cursorGuia.appendChild(cursorPunto);
+  document.body.appendChild(cursorGuia);
+
+  // Limpieza por navegación: en carga completa el content script se recrea
+  // (overlay fresco), pero en navegación SPA / hash / back-forward el script
+  // persiste y un cursor apuntando a un elemento que ya no existe quedaría
+  // colgado. pagehide cubre además el repintado durante la descarga.
+  window.addEventListener("pagehide", limpiarGuiasVisuales);
+  window.addEventListener("popstate", limpiarGuiasVisuales);
+  window.addEventListener("hashchange", limpiarGuiasVisuales);
+
   // ---- Handlers ----
   boton.addEventListener("click", () => {
     panel.classList.toggle("ag-oculto");
@@ -2300,9 +3365,10 @@
           && chat.mensajes.length === 0) {
         saludoLeidoEnEstaSesion = true;
         // En Google leemos el saludo de presentación con "Iqui" (pronunciación
-        // más natural que "Iky"). En página externa leemos el disclaimer
-        // contextual tal cual; no menciona el nombre del asistente.
-        leerTexto(esPaginaExterna() ? AG_SALUDO_PAGINA_EXTERNA : AG_SALUDO_TTS);
+        // más natural que "Iky"). En página externa leemos el texto real del
+        // saludo (disclaimer normal, o aviso preventivo 2G si es sensible);
+        // no menciona el nombre del asistente.
+        leerTexto(esPaginaExterna() ? saludo.textContent : AG_SALUDO_TTS);
       }
       // Auto-encender modo escucha si el usuario lo dejó activo (es el
       // default). iniciarModoEscucha NO corta el TTS — comenzarEscucharCiclo
@@ -2329,6 +3395,9 @@
       // la cierra si el modo escucha estaba activo.
       cerrarVentanaConversacion();
       actualizarEstadoMic();
+      // La guía visual (resaltado + cursor) acompaña al panel: al cerrarlo,
+      // desaparece de inmediato.
+      limpiarGuiasVisuales();
     }
   });
 
@@ -2341,6 +3410,13 @@
       input.focus();
       return;
     }
+    _perfPreguntaInicio = perfNow();
+    perfLog("pregunta_recibida", {
+      textoLength: texto.length,
+      esGoogle: esGoogle(),
+      esPaginaExterna: esPaginaExterna(),
+      modoSensible: modoPaginaSensible.esSensible,
+    });
     // Conversacional primero: si el usuario dijo "sí"/"no"/"búscalo"/etc
     // y hay una acción pendiente, avanzamos sin llamar backend. También
     // atajamos "sí"/"no" sueltos sin contexto para no confundir a la IA.
@@ -2353,6 +3429,7 @@
     // cuota del modelo en frases que nunca se ejecutarían. El backend
     // safety-rules sigue siendo segunda capa.
     if (clasificarRiesgoTexto(texto) === "ALTO") {
+      perfLog("pregunta_bloqueada_local", { duracionMs: perfDuracion(_perfPreguntaInicio) });
       agregarMensaje(RESPUESTA_FUERA_DE_ALCANCE_LOCAL);
       input.focus();
       return;
@@ -2372,7 +3449,14 @@
       input.focus();
       return;
     }
+    perfLog("interpretacion_inicio", {});
+    const _tInterp = perfNow();
     const intencion = await interpretarPrincipal(texto);
+    perfLog("interpretacion_fin", {
+      duracionMs: perfDuracion(_tInterp),
+      fuente: intencion.fuente,
+      tipo: intencion.tipo,
+    });
     // Riesgo se calcula en cliente con regla determinística. Decide si la
     // acción se ejecuta directo (BAJO), pide una confirmación (MEDIO) o
     // se bloquea con mensaje seguro (ALTO).
@@ -2420,6 +3504,15 @@
 
   btnReiniciar.addEventListener("click", reiniciarAyuda);
 
+  // Toggle manual de compacto. Marca control manual: la auto-compactación lo
+  // respeta durante RESPETAR_CONTROL_MANUAL_MS para no pelear con el usuario.
+  btnMinimizar.addEventListener("click", () => {
+    const compactar = !panel.classList.contains("ag-panel-compacto");
+    setCompacto(compactar);
+    _compactoAuto = false;
+    _controlManualTs = Date.now();
+  });
+
   // Estado inicial de los botones de voz y del indicador de micrófono.
   actualizarBotonVoz();
   actualizarBotonHablar();
@@ -2445,7 +3538,7 @@
       // Llegamos aquí justo después de una búsqueda iniciada por el asistente.
       // agregarMensaje empuja al array y guarda con busquedaEnCurso ya en false.
       agregarMensaje(
-        "Ya está viendo los resultados de Google. Los títulos azules son páginas que puede abrir."
+        "Ya ve los resultados. Si quiere, le explico cuál mirar."
       );
     } else {
       // Sin búsqueda en curso: solo persistir el estado reconstituido.

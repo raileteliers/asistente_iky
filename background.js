@@ -106,11 +106,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     // HITO 2E: agregamos `historial` (turnos previos del chat de página).
-    // Se reenvía tal cual; el backend lo sanea y lo cap-ea.
+    // HITO 2F: `candidatos` opcionales (idx sugeridos por el ranking local).
+    // Se reenvía tal cual; el backend lo sanea y lo cap-ea. Si llega
+    // undefined, JSON.stringify lo omite (compatibilidad hacia atrás).
     body: JSON.stringify({
       pregunta: msg.pregunta,
       historial: msg.historial,
       pagina: msg.pagina,
+      candidatos: msg.candidatos,
+      // HITO 2G: flag opcional de modo sensible. undefined -> JSON lo omite.
+      seguridad: msg.seguridad,
     }),
     signal: controller.signal,
   })

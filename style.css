@@ -6,9 +6,10 @@
   bottom: 24px;
   right: 24px;
   z-index: 2147483646;
-  padding: 16px 28px;
+  /* Proporcional al viewport pero acotado: nunca minúsculo ni gigante. */
+  padding: clamp(10px, 2vw, 16px) clamp(16px, 3vw, 28px);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 20px;
+  font-size: clamp(16px, 2.2vw, 20px);
   font-weight: 600;
   color: #ffffff;
   background-color: #1a73e8;
@@ -16,6 +17,11 @@
   border-radius: 32px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
   cursor: pointer;
+  /* En ventanas chicas no debe ocupar gran parte del ancho. */
+  max-width: 60vw;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #ag-boton-ayuda:hover {
@@ -27,8 +33,11 @@
   bottom: 96px;
   right: 24px;
   z-index: 2147483647;
-  width: 360px;
-  max-height: 70vh;
+  /* Proporcional al ancho de la pestaña, acotado entre 260 y 360px, y nunca
+     más ancho que el viewport menos 24px de margen a cada lado. */
+  width: clamp(260px, 28vw, 360px);
+  max-width: calc(100vw - 48px);
+  max-height: min(70vh, 560px);
   overflow-y: auto;
   padding: 20px;
   background-color: #ffffff;
@@ -44,10 +53,92 @@
   display: none;
 }
 
-#ag-panel h2 {
+/* Header: título + botón Minimizar/Expandir en una fila. */
+#ag-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin: 0 0 8px 0;
+}
+
+#ag-panel #ag-header h2 {
+  margin: 0;
   font-size: 22px;
   color: #1a73e8;
+}
+
+#ag-minimizar {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  font-size: clamp(13px, 1.6vw, 15px);
+  font-family: inherit;
+  font-weight: 600;
+  color: #5f6368;
+  background-color: #ffffff;
+  border: 2px solid #dadce0;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#ag-minimizar:hover {
+  background-color: #f1f3f4;
+}
+
+/* Modo compacto: barra reducida con solo header + estado de micrófono.
+   Oculta el grueso del contenido para no tapar el elemento guiado. */
+#ag-panel.ag-panel-compacto {
+  max-height: clamp(56px, 16vh, 120px);
+  overflow: hidden;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
+#ag-panel.ag-panel-compacto > #ag-header {
+  margin-bottom: 0;
+}
+
+#ag-panel.ag-panel-compacto > .ag-saludo,
+#ag-panel.ag-panel-compacto > #ag-mensajes,
+#ag-panel.ag-panel-compacto > #ag-voz,
+#ag-panel.ag-panel-compacto > #ag-acciones-contextuales,
+#ag-panel.ag-panel-compacto > #ag-input,
+#ag-panel.ag-panel-compacto > .ag-acciones {
+  display: none;
+}
+
+/* Reposición: si compacto aún tapa el objetivo, el panel salta a la izquierda. */
+#ag-panel.ag-panel-izquierda {
+  right: auto;
+  left: 24px;
+}
+
+/* Pantallas angostas: el panel ocupa casi todo el ancho con márgenes de 12px
+   (nunca se sale de pantalla) y el botón flotante se achica. La reposición a la
+   izquierda no aplica aquí (el panel ya es full-width). */
+@media (max-width: 480px) {
+  #ag-panel {
+    left: 12px;
+    right: 12px;
+    width: auto;
+    max-width: none;
+    bottom: 84px;
+    border-radius: 12px;
+  }
+
+  #ag-panel.ag-panel-izquierda {
+    left: 12px;
+    right: 12px;
+  }
+
+  #ag-boton-ayuda {
+    bottom: 12px;
+    right: 12px;
+    padding: 10px 16px;
+    font-size: 16px;
+    border-radius: 24px;
+  }
 }
 
 #ag-panel p.ag-saludo {
@@ -262,4 +353,83 @@
   outline-offset: 4px !important;
   box-shadow: 0 0 16px rgba(26, 115, 232, 0.5) !important;
   border-radius: 8px !important;
+}
+
+/* ---- Cursor virtual de guía visual (HITO 3) ----
+   Overlay que viaja desde la zona del panel hacia el elemento resaltado para
+   indicarle al usuario dónde mirar / dónde debería pinchar. NUNCA interactúa:
+   pointer-events:none garantiza que no bloquea ni recibe clics de la página.
+   Oculto por defecto (display:none); JS lo muestra al guiar. */
+#ag-cursor {
+  position: fixed;
+  left: 0;
+  top: 0;
+  /* El punto de anclaje es (0,0); los hijos se centran sobre él. Movemos el
+     cursor con transform translate para una animación de viaje suave. */
+  width: 0;
+  height: 0;
+  z-index: 2147483645; /* bajo el panel (…647) y el botón (…646) */
+  pointer-events: none;
+  display: none;
+  transform: translate(-9999px, -9999px);
+  transition: transform 950ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+/* Punto visible (círculo de alto contraste). Centrado sobre el anclaje. */
+#ag-cursor .ag-cursor-punto {
+  position: absolute;
+  left: -15px;
+  top: -15px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #ffffff 0%, #1a73e8 65%);
+  border: 3px solid #ffffff;
+  /* Doble sombra: anillo azul + sombra oscura para contraste sobre fondos
+     claros u oscuros. */
+  box-shadow: 0 0 0 3px #1a73e8, 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+/* Halo de pulso al llegar. Centrado sobre el anclaje, oculto salvo cuando
+   se activa una de las clases de estado. */
+#ag-cursor .ag-cursor-halo {
+  position: absolute;
+  left: -26px;
+  top: -26px;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 3px solid #1a73e8;
+  opacity: 0;
+  will-change: transform, opacity;
+}
+
+/* Pulso animado: estado normal al llegar al elemento. */
+#ag-cursor.ag-cursor-pulso .ag-cursor-halo {
+  animation: ag-cursor-pulso-anim 1.4s ease-out infinite;
+}
+
+/* Halo estático: para reduced-motion y páginas sensibles (sin animación). */
+#ag-cursor.ag-cursor-estatico .ag-cursor-halo {
+  opacity: 0.55;
+}
+
+@keyframes ag-cursor-pulso-anim {
+  0%   { transform: scale(0.6); opacity: 0.7; }
+  70%  { transform: scale(1.7); opacity: 0; }
+  100% { transform: scale(1.7); opacity: 0; }
+}
+
+/* Accesibilidad: si el usuario pidió menos movimiento, no animamos nada.
+   El cursor salta directo al destino (transition:none) y el halo queda
+   estático en vez de pulsar. */
+@media (prefers-reduced-motion: reduce) {
+  #ag-cursor {
+    transition: none !important;
+  }
+  #ag-cursor.ag-cursor-pulso .ag-cursor-halo {
+    animation: none !important;
+    opacity: 0.55;
+  }
 }

@@ -19,6 +19,13 @@ if (!process.env.GROQ_API_KEY) {
 
 const client = new Groq();
 
+// HITO S1: log de performance del backend, detrás de DEBUG_PERF=true. Nunca
+// loguea API keys, texto del usuario, página ni historial completos.
+function perfLogBackend(evento, data) {
+  if (process.env.DEBUG_PERF !== "true") return;
+  console.log("[Iky][perf]", evento, JSON.stringify(data || {}));
+}
+
 const TIPOS_PERMITIDOS = new Set([
   "RESALTAR_BARRA",
   "GUIAR_BUSQUEDA",
@@ -179,12 +186,14 @@ const EXPLICAR_PAGINA_MAX_RESPUESTA = 400;
 // Historial (chat de página). Cap defensivo aunque el cliente ya recorta.
 const EXPLICAR_PAGINA_MAX_HISTORIAL = 4;
 const EXPLICAR_PAGINA_MAX_TURNO_HISTORIAL = 400;
+// HITO 2F: candidatos sugeridos por el ranking local del cliente. Máx 5.
+const EXPLICAR_PAGINA_MAX_CANDIDATOS = 5;
 const RESPUESTA_PAGINA_SEGURA_FIJA =
   "Por seguridad, puedo explicarle la página y marcarle elementos, pero no puedo hacer clic, escribir datos ni realizar acciones sensibles.";
 const RESPUESTA_PAGINA_NO_SEGURO =
   "No estoy seguro de lo que aparece en esta página.";
 
-const SYSTEM_PROMPT_PAGINA = `Eres Iky, un asistente para adultos mayores chilenos. Te van a entregar un resumen SEGURO de una página web (no es HTML literal) y una pregunta del usuario. Debes responder en español chileno con una idea breve, basándote SOLO en el resumen y en los turnos previos del chat si vienen.
+const SYSTEM_PROMPT_PAGINA = `Eres Iky, un asistente para adultos mayores chilenos. Te van a entregar un resumen SEGURO de una página web (no es HTML literal) y una pregunta del usuario. Responde en español chileno, en MÁXIMO 2 frases cortas y de forma directa, basándote SOLO en el resumen y en los turnos previos del chat si vienen.
 
 CONVERSACIÓN
 
@@ -193,7 +202,7 @@ Es posible que antes de la pregunta actual recibas mensajes anteriores del usuar
 - mantener consistencia con lo que ya dijiste.
 - no repetir información que ya entregaste salvo que el usuario pida repetir.
 
-Si la pregunta es ambigua y no tienes contexto suficiente, puedes responder algo como: "No estoy seguro. ¿Quiere que le marque los botones principales o que le resuma la página?"
+Si la pregunta es ambigua y no tienes contexto suficiente, puedes responder algo como: "No estoy seguro. ¿Quiere que le resuma la página o le marque las opciones?"
 
 ENTRADA DEL TURNO ACTUAL (JSON dentro del último mensaje de usuario)
 
@@ -220,17 +229,21 @@ ENTRADA DEL TURNO ACTUAL (JSON dentro del último mensaje de usuario)
 
 REGLAS DURAS
 
-- Máximo 400 caracteres por respuesta. Una sola idea. Sin Markdown, sin emojis, sin HTML.
+- Sé breve: apunta a 220 caracteres o menos (máximo absoluto 400). Una sola idea, máximo 2 frases. Sin Markdown, sin emojis, sin HTML.
+- Si marcas un elemento (devuelves elementoAResaltar), di EN EL MENSAJE qué elemento marcaste (ej. "Le marqué el botón de menú."). Si no marcas nada, no lo menciones.
+- No repitas muletillas como "puedo ayudarle", "estoy aquí para" ni "si lo desea" en cada respuesta. Ve directo a la idea.
 - Solo usa información presente en el resumen (titulo, encabezados, textoVisible, elementos) o en el historial. Si la información no está, di "no estoy seguro de lo que aparece aquí" o similar.
 - NUNCA afirmes que hiciste clic, escribiste, ingresaste, abriste o ejecutaste algo. No digas "abrí", "hice clic", "escribí", "entré". Solo describes o ubicas.
 - NUNCA recomiendes ingresar claves, contraseñas, datos bancarios, pagar, comprar, transferir o dar información personal. Si la pregunta pide cualquiera de esas cosas, responde con: "Por seguridad, puedo explicarle la página y marcarle elementos, pero no puedo hacer clic, escribir datos ni realizar acciones sensibles."
 - Si el usuario pide UBICAR algo (ej. "dónde está iniciar sesión") y existe un elemento en "elementos" cuyo texto/ariaLabel/placeholder coincide razonablemente, devuelve su "idx" como entero en elementoAResaltar. Si no hay coincidencia clara, devuelve null.
+- A veces recibirás una lista "candidatos" (idx ya válidos preseleccionados por el cliente). Si vas a devolver elementoAResaltar, elige uno de esos idx candidatos. Si ninguno corresponde con seguridad, devuelve null. NUNCA elijas un idx fuera de "candidatos" cuando la lista venga presente.
+- MODO SENSIBLE: si el sistema indica que la página es sensible (login/checkout/banca/identidad), NO guíes a iniciar sesión, ingresar, continuar, confirmar ni pagar. No sugieras apretar "iniciar sesión", "pagar" ni "confirmar". Solo explica el contenido general y, si acaso, menciona secciones NO sensibles (ayuda, contacto, privacidad). En modo sensible devuelve SIEMPRE elementoAResaltar = null.
 - elementoAResaltar SOLO puede ser un entero entre 0 y elementos.length-1, o null. NO inventes índices. NO devuelvas selectores, NO devuelvas JS.
 
 FORMATO DE RESPUESTA (JSON literal, sin texto antes ni después)
 
 {
-  "mensaje": "<máx 400 caracteres, una idea>",
+  "mensaje": "<breve: ≤220 caracteres ideal, máx 400; una idea>",
   "elementoAResaltar": <entero válido del arreglo elementos o null>
 }`;
 
@@ -359,6 +372,7 @@ app.use(express.json({ limit: "10kb" }));
 app.get("/health", (_req, res) => res.json({ ok: true, model: MODEL }));
 
 app.post("/interpretar", async (req, res) => {
+  const _tReq = Date.now();
   const { texto, contexto } = req.body || {};
 
   if (typeof texto !== "string" || !texto.trim()) {
@@ -418,8 +432,10 @@ app.post("/interpretar", async (req, res) => {
       return res.status(502).json({ error: "Respuesta no es JSON válido." });
     }
 
+    perfLogBackend("request_fin", { endpoint: "/interpretar", duracionMs: Date.now() - _tReq, ok: true, provider: "groq" });
     return res.json(validarRespuesta(raw));
   } catch (err) {
+    perfLogBackend("request_fin", { endpoint: "/interpretar", duracionMs: Date.now() - _tReq, ok: false, provider: "groq", status: err?.status || null });
     // Groq SDK expone .status estilo OpenAI (429 = rate limit, 5xx = server).
     if (err?.status === 429) {
       console.warn("/interpretar: rate limit");
@@ -437,6 +453,7 @@ app.post("/interpretar", async (req, res) => {
 // Privacidad: este endpoint sólo recibe el texto final del asistente que
 // se va a leer. No recibe URL, contexto ni texto crudo del usuario.
 app.post("/tts", async (req, res) => {
+  const _tReq = Date.now();
   const { texto } = req.body || {};
   const apiKey = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
@@ -468,18 +485,21 @@ app.post("/tts", async (req, res) => {
       }
     );
     if (!r.ok) {
+      perfLogBackend("request_fin", { endpoint: "/tts", duracionMs: Date.now() - _tReq, ok: false, provider: "elevenlabs", status: r.status });
       // No exponemos el status real al cliente: colapsa todo a un único
       // error genérico para no filtrar detalles operacionales.
       console.warn("/tts: ElevenLabs HTTP", r.status);
       return res.json({ ok: false, error: "TTS_NO_DISPONIBLE" });
     }
     const buf = Buffer.from(await r.arrayBuffer());
+    perfLogBackend("request_fin", { endpoint: "/tts", duracionMs: Date.now() - _tReq, ok: true, provider: "elevenlabs" });
     return res.json({
       ok: true,
       audioBase64: buf.toString("base64"),
       contentType: "audio/mpeg",
     });
   } catch (err) {
+    perfLogBackend("request_fin", { endpoint: "/tts", duracionMs: Date.now() - _tReq, ok: false, provider: "elevenlabs", error: err && err.name === "AbortError" ? "timeout" : "error" });
     // AbortError (timeout) y errores de red caen aquí. Nunca logueamos
     // la clave; sólo el nombre del error o el mensaje corto.
     console.warn(
@@ -552,6 +572,43 @@ function sanearPaginaPayload(pagina) {
   return { url, titulo, encabezados, textoVisible, elementos };
 }
 
+// HITO 2F: sanea los candidatos sugeridos por el ranking local del cliente.
+// Solo conserva idx ENTEROS y EN RANGO del arreglo elementos ya saneado, con
+// texto/razon recortados y score numérico. Máx EXPLICAR_PAGINA_MAX_CANDIDATOS.
+// Si el input es inválido o ningún idx es válido, devuelve [].
+function sanearCandidatos(candidatos, paginaSegura) {
+  if (!Array.isArray(candidatos)) return [];
+  const max = paginaSegura.elementos.length - 1;
+  const out = [];
+  for (const c of candidatos) {
+    if (!c || typeof c !== "object") continue;
+    if (!Number.isInteger(c.idx) || c.idx < 0 || c.idx > max) continue;
+    const texto = c.texto != null ? sanitizarTextoBase(c.texto, 80) : null;
+    const razon = c.razon != null ? sanitizarTextoBase(c.razon, 120) : null;
+    const score = Number.isFinite(c.score) ? Math.round(c.score) : null;
+    out.push({ idx: c.idx, texto, razon, score });
+    if (out.length >= EXPLICAR_PAGINA_MAX_CANDIDATOS) break;
+  }
+  return out;
+}
+
+// HITO 2G: sanea el flag de seguridad enviado por el cliente. Solo acepta
+// niveles conocidos y razones como etiquetas cortas (jamás datos del usuario;
+// el cliente ya manda razones genéricas). Devuelve null si no es sensible o
+// el input es inválido — así el handler sigue el camino normal.
+function sanearSeguridad(seguridad) {
+  if (!seguridad || typeof seguridad !== "object" || seguridad.esSensible !== true) return null;
+  const nivel = seguridad.nivel === "ALTO" || seguridad.nivel === "MEDIO" ? seguridad.nivel : "MEDIO";
+  const razones = Array.isArray(seguridad.razones)
+    ? seguridad.razones
+        .filter((r) => typeof r === "string")
+        .map((r) => sanitizarTextoBase(r, 40))
+        .filter(Boolean)
+        .slice(0, 8)
+    : [];
+  return { esSensible: true, nivel, razones };
+}
+
 // Sanea el historial del chat de página. Acepta un array de turnos
 // {rol: "usuario"|"asistente", texto}. Devuelve los últimos N turnos
 // con texto saneado. Si el input es inválido, devuelve []. NUNCA se
@@ -590,6 +647,7 @@ function validarRespuestaPagina(raw, paginaSegura) {
 }
 
 async function explicarPaginaHandler(req, res) {
+  const _tReq = Date.now();
   const { pregunta, historial, pagina } = req.body || {};
 
   if (typeof pregunta !== "string" || !pregunta.trim()) {
@@ -617,12 +675,39 @@ async function explicarPaginaHandler(req, res) {
   // como mensajes "user"/"assistant" antes del turno actual. Los turnos
   // ya están saneados; los rols se mapean al vocabulario de Groq.
   const historialSeguro = sanearHistorialPagina(historial);
+  // HITO 2F: candidatos sugeridos por el cliente (idx ya válidos). Si vienen,
+  // se inyectan como restricción para que el modelo elija entre pocos.
+  const candidatosSeguros = sanearCandidatos(req.body && req.body.candidatos, paginaSegura);
+  // HITO 2G: flag de seguridad. Si la página es sensible, reforzamos el prompt
+  // y forzamos elementoAResaltar = null al final (no se confía en el modelo).
+  const seguridadSegura = sanearSeguridad(req.body && req.body.seguridad);
 
   const messages = [{ role: "system", content: SYSTEM_PROMPT_PAGINA }];
   for (const turno of historialSeguro) {
     messages.push({
       role: turno.rol === "asistente" ? "assistant" : "user",
       content: turno.texto,
+    });
+  }
+  // En modo sensible, candidatos no aplican (no resaltamos). Solo refuerzo.
+  if (seguridadSegura) {
+    messages.push({
+      role: "system",
+      content:
+        "ATENCIÓN: esta página es SENSIBLE (nivel " + seguridadSegura.nivel + "). " +
+        "No guíes a iniciar sesión, ingresar, continuar, confirmar ni pagar. " +
+        "No sugieras apretar botones de login/pago/confirmación. Solo explica el " +
+        "contenido general y, si corresponde, menciona secciones no sensibles " +
+        "(ayuda, contacto, privacidad). Devuelve elementoAResaltar = null.",
+    });
+  } else if (candidatosSeguros.length > 0) {
+    messages.push({
+      role: "system",
+      content:
+        "El cliente sugiere estos candidatos (idx ya válidos del arreglo elementos): " +
+        JSON.stringify(candidatosSeguros) +
+        ". Si vas a devolver elementoAResaltar, elige uno de estos idx. " +
+        "Si ninguno corresponde con seguridad, devuelve null.",
     });
   }
   // Turno actual: la pregunta acompañada del resumen estructurado.
@@ -656,8 +741,13 @@ async function explicarPaginaHandler(req, res) {
         elementoAResaltar: null,
       });
     }
-    return res.json(validarRespuestaPagina(raw, paginaSegura));
+    const resultado = validarRespuestaPagina(raw, paginaSegura);
+    // HITO 2G: en modo sensible, nunca resaltamos (aunque el modelo lo intente).
+    if (seguridadSegura) resultado.elementoAResaltar = null;
+    perfLogBackend("request_fin", { endpoint: "/explicar-pagina", duracionMs: Date.now() - _tReq, ok: true, provider: "groq", sensible: !!seguridadSegura });
+    return res.json(resultado);
   } catch (err) {
+    perfLogBackend("request_fin", { endpoint: "/explicar-pagina", duracionMs: Date.now() - _tReq, ok: false, provider: "groq", status: err?.status || null });
     if (err?.status === 429) {
       console.warn("/explicar-pagina: rate limit");
       return res.status(429).json({ error: "Rate limit." });
