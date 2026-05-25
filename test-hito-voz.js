@@ -1,5 +1,8 @@
 // Verificación read-only del fix de flujo de voz (Google):
-//   Fix 1 — "quiero usar/abrir X" ejecuta directo (riesgo BAJO), no MEDIO.
+//   Fix 1 — toda búsqueda confirma: RESALTAR_CON_CONSULTA es SIEMPRE MEDIO
+//           (escribe en la barra y pregunta antes de ejecutar). Antes
+//           "busca X"/"quiero usar X" iban directo (BAJO); esBusquedaDirecta
+//           ya no decide el flujo.
 //   Fix 2 — clasificarRespuestaConversacional tolera afirmación + palabras
 //           extra (deja de loopear), pero sigue exigiendo una palabra
 //           accionable y mantiene la prioridad del rechazo.
@@ -27,10 +30,8 @@ function eq(a, b, msg) {
 }
 
 // --- Bloques reales de producción ---
-const verbosSrc = entre(CONTENT, "const VERBOS_BUSQUEDA_DIRECTA = [", "// ---- Branding");
-const palabrasSrc = entre(CONTENT, "const AG_PALABRAS_CLAVE_ESCUCHA = [", "const AG_SALUDO_VISIBLE");
 const normalizarSrc = entre(CONTENT, "function normalizar(texto) {", "function limpiarEspacios(texto) {");
-const busquedaSrc = entre(CONTENT, "function esBusquedaDirecta(texto) {", "// Devuelve \"BAJO\"");
+const riesgoSrc = entre(CONTENT, "function clasificarRiesgoAccion(intencion, texto) {", "function esVisible(el) {");
 const conversacionalSrc = entre(
   CONTENT,
   "function clasificarRespuestaConversacional(texto) {",
@@ -38,29 +39,29 @@ const conversacionalSrc = entre(
 );
 
 const F = new Function(
-  palabrasSrc + "\n" + verbosSrc + "\n" + normalizarSrc + "\n" +
-  busquedaSrc + "\n" + conversacionalSrc + "\n" +
-  "return { esBusquedaDirecta, clasificarRespuestaConversacional };"
+  normalizarSrc + "\n" +
+  // Stub: el bloqueo por términos sensibles (riesgo ALTO) lo cubre test-hito2g.
+  "function contieneTerminosSensibles(){ return false; }\n" +
+  riesgoSrc + "\n" + conversacionalSrc + "\n" +
+  "return { clasificarRiesgoAccion, clasificarRespuestaConversacional };"
 )();
 
 // ============================================================
-// [1] Fix 1 — "quiero usar/abrir X" es búsqueda directa (=> BAJO)
+// [1] Fix 1 — toda búsqueda confirma: RESALTAR_CON_CONSULTA => MEDIO
 // ============================================================
-console.log("[1] esBusquedaDirecta — uso/acceso directo");
-ok(F.esBusquedaDirecta("quiero usar chatgpt"), "'quiero usar X' -> directo (BAJO)");
-ok(F.esBusquedaDirecta("quiero usar chat juguete"), "transcripción real del log -> directo");
-ok(F.esBusquedaDirecta("quiero abrir youtube"), "'quiero abrir X' -> directo");
-ok(F.esBusquedaDirecta("quiero ir a youtube"), "'quiero ir a X' -> directo");
-ok(F.esBusquedaDirecta("quiero entrar a gmail"), "'quiero entrar a X' -> directo");
-ok(F.esBusquedaDirecta("necesito usar maps"), "'necesito usar X' -> directo");
-ok(F.esBusquedaDirecta("abre youtube"), "'abre X' -> directo");
-ok(F.esBusquedaDirecta("Iky, quiero usar chatgpt"), "prefijo wake-word se limpia -> directo");
-// No deben ejecutarse directo (siguen MEDIO/según intent)
-ok(!F.esBusquedaDirecta("ahora qué hago"), "frase neutra sin verbo -> NO directo");
-ok(!F.esBusquedaDirecta("dónde escribo"), "pregunta de ubicación -> NO directo");
-// Las de búsqueda explícita siguen funcionando
-ok(F.esBusquedaDirecta("busca chatgpt"), "'busca X' sigue siendo directo");
-ok(F.esBusquedaDirecta("quiero buscar receta de cazuela"), "'quiero buscar X' sigue directo");
+console.log("[1] clasificarRiesgoAccion — toda búsqueda escribe y confirma (MEDIO)");
+const conConsulta = (texto) => F.clasificarRiesgoAccion({ tipo: "RESALTAR_CON_CONSULTA" }, texto);
+eq(conConsulta("busca chatgpt"), "MEDIO", "'busca X' ya NO va directo -> MEDIO");
+eq(conConsulta("quiero buscar receta de cazuela"), "MEDIO", "'quiero buscar X' -> MEDIO");
+eq(conConsulta("quiero usar chatgpt"), "MEDIO", "'quiero usar X' -> MEDIO");
+eq(conConsulta("quiero abrir youtube"), "MEDIO", "'quiero abrir X' -> MEDIO");
+eq(conConsulta("abre gmail"), "MEDIO", "'abre X' -> MEDIO");
+eq(conConsulta("noticias de hoy"), "MEDIO", "frase sin verbo -> MEDIO");
+eq(conConsulta("Iky, busca chatgpt"), "MEDIO", "con prefijo wake-word -> MEDIO");
+// Otros intents conservan su tier (no se tocan).
+eq(F.clasificarRiesgoAccion({ tipo: "RESALTAR_BARRA" }, "donde escribo"), "BAJO", "RESALTAR_BARRA -> BAJO");
+eq(F.clasificarRiesgoAccion({ tipo: "EXPLICAR_RESULTADOS" }, "que dice"), "BAJO", "EXPLICAR_RESULTADOS -> BAJO");
+eq(F.clasificarRiesgoAccion({ tipo: "ABRIR_PRIMER_RESULTADO" }, "abre el primero"), "MEDIO", "ABRIR_PRIMER_RESULTADO -> MEDIO");
 
 // ============================================================
 // [2] Fix 2 — afirmación + palabras extra ya NO loopea

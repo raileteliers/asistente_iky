@@ -5,6 +5,9 @@
   // HITO S1 — instrumentación de fluidez/latencia. Solo console.debug, detrás
   // de un flag; no cambia comportamiento ni envía telemetría externa.
   const AG_DEBUG_PERF = true;
+  // TEMPORAL: loguea el texto exacto que se manda a TTS para ubicar frases que
+  // suenan mal. Quitar (o poner en false) al terminar el diagnóstico.
+  const AG_DEBUG_TEXTO_VOZ = true;
 
   // Log de performance, suprimido salvo que AG_DEBUG_PERF esté activo.
   function perfLog(evento, data) {
@@ -123,9 +126,9 @@
   const AG_SALUDO_PAGINA_EXTERNA =
     "Veo esta página. Puedo guiarlo si lo desea.";
   // Respuesta fija cuando el usuario, en página externa, pide buscar en
-  // Google. No abrimos pestaña — el usuario decide si vuelve.
+  // Google. No navegamos solos — lo orientamos a volver con el botón Atrás.
   const RESPUESTA_VOLVER_A_GOOGLE =
-    "Para buscar en Google, vuelva a esa pestaña.";
+    "Para volver a Google, toque el botón Atrás del navegador.";
 
   // ---- Persistencia de chat por pestaña (sessionStorage) ----
   const STORAGE_KEY = "AG_ESTADO_CHAT_V1";
@@ -140,6 +143,10 @@
   // pestaña). Guardamos solo {urlKey, historial}. NUNCA guardamos el resumen
   // del DOM ni textoVisible ni la lista de elementos: eso vive solo en memoria.
   const CHAT_PAGINA_KEY = "AG_CHAT_PAGINA_V1";
+  // Bandera de auto-apertura (chrome.storage.local, global a la extensión). La
+  // setea la pestaña que abre un resultado y la lee la página de destino al
+  // cargar: cruza el cambio de origen, donde local/sessionStorage no llegan.
+  const AUTO_ABRIR_KEY = "AG_AUTO_ABRIR_IKY";
   // Cap del historial persistido en sessionStorage. El backend recibe un
   // subconjunto aún más chico (HISTORIAL_BACKEND_MAX).
   const HISTORIAL_CHAT_MAX = 10;
@@ -228,10 +235,6 @@
   // saludo y "ya avisé que no hay soporte" viven solo en esta carga de página.
   let vozActivada = obtenerPreferenciaVoz();
   let saludoLeidoEnEstaSesion = false;
-  // True solo en esta carga: la pestaña fue abierta por Iky desde otra
-  // pestaña, así que apagamos voz y mic para no contestar dos veces.
-  // No se persiste; recargar la página vuelve al comportamiento normal.
-  let _silenciadoPorOrigen = false;
 
   // Estado de reproducción ElevenLabs. Las URLs de objeto se revocan al
   // terminar/error para no filtrar memoria. No se persiste: cada carga
@@ -269,9 +272,13 @@
   // durante VENTANA_CONVERSACION_MS. La ventana se renueva con cada turno
   // y se cierra al desactivar modo escucha, cerrar panel o reiniciar ayuda.
   // No se persiste: solo memoria.
-  const VENTANA_CONVERSACION_MS = 20000;
+  const VENTANA_CONVERSACION_MS = 15000;
   let conversacionActivaHasta = 0;
   let ventanaConversacionTimer = null;
+  // Cierre automático del micrófono: 20s desde el último turno (5s después de
+  // que expira la ventana). Se reinicia en cada turno junto con la ventana.
+  const CIERRE_MIC_MS = 20000;
+  let cierreMicTimer = null;
 
   // Estado conversacional: si hay una acción a la que el usuario puede
   // responder por voz/texto (sí/no/búscalo/etc), aquí queda registrada.
@@ -662,9 +669,9 @@
       case "DESCONOCIDO":
         return "BAJO";
       case "RESALTAR_CON_CONSULTA":
-        // "busca X" = el usuario es explícito → ejecuta sin confirmar.
-        // "quiero usar X" = intención implícita → confirma una vez.
-        return esBusquedaDirecta(texto) ? "BAJO" : "MEDIO";
+        // Toda búsqueda escribe en la barra y confirma una vez antes de
+        // ejecutarse (antes "busca X" iba directo, sin confirmar).
+        return "MEDIO";
       case "ABRIR_PRIMER_RESULTADO":
         // Abrir un dominio externo siempre necesita confirmación.
         return "MEDIO";
@@ -712,6 +719,9 @@
     return mejor;
   }
 
+  // HITO V3 — índice del resultado de Google actualmente marcado. -1 = ninguno.
+  let indiceResultadoGoogleMarcado = -1;
+
   function estaEnPaginaResultados() {
     // 1) Chequeo de URL (lo más confiable cuando está disponible).
     const url = new URL(window.location.href);
@@ -750,10 +760,11 @@
       const yaPregunta = /\?\s*$/.test(explicacion) || /\bquiere\b/i.test(explicacion);
       const mensajeCombinado = yaPregunta
         ? explicacion
-        : explicacion + " ¿Lo abro en otra pestaña?";
+        : explicacion + " ¿Abro la página?";
       agregarMensaje(mensajeCombinado);
       resaltar(resultado.contenedor);
       mostrarAccionAbrirPrimerResultado(resultado);
+      indiceResultadoGoogleMarcado = 0; // HITO V3: sincroniza el ciclo con lo marcado
     } else {
       // No detectamos primer resultado (módulos especiales, layout raro):
       // hardcoded porque el mensaje IA pudo asumir que sí lo había.
@@ -763,7 +774,10 @@
     }
   }
 
-  function encontrarPrimerResultadoConEnlace() {
+  // Recolecta TODOS los resultados orgánicos válidos (enlace + h3 visibles,
+  // URL externa real), en orden del DOM y deduplicando por contenedor para no
+  // listar sitelinks de la misma card como resultados distintos.
+  function recolectarResultadosGoogle() {
     // Intentamos acotar la búsqueda al contenedor principal de resultados orgánicos.
     const scope =
       document.querySelector("#search #rso") ||
@@ -772,6 +786,8 @@
       document.body;
 
     const enlaces = scope.querySelectorAll("a");
+    const vistos = new Set();
+    const resultados = [];
     for (const enlace of enlaces) {
       const h3 = enlace.querySelector("h3");
       if (!h3 || !esVisible(enlace) || !esVisible(h3)) continue;
@@ -801,9 +817,21 @@
         enlace.closest("[data-hveid]") ||
         enlace.parentElement ||
         enlace;
-      return { contenedor, enlace, url };
+      if (vistos.has(contenedor)) continue;
+      vistos.add(contenedor);
+      resultados.push({ contenedor, enlace, url });
     }
-    return null;
+    return resultados;
+  }
+
+  // Devuelve el resultado N-ésimo (0-based) o null. HITO V3: habilita ciclar
+  // "otro resultado" sin abrir nada.
+  function encontrarResultadoGooglePorIndice(indice) {
+    return recolectarResultadosGoogle()[indice] || null;
+  }
+
+  function encontrarPrimerResultadoConEnlace() {
+    return encontrarResultadoGooglePorIndice(0);
   }
 
   function resaltar(el) {
@@ -2288,65 +2316,55 @@
     );
   }
 
+  // Ventana de frescura de la bandera de auto-apertura: si la marca tiene más
+  // de esto, se ignora (evita auto-abrir Iky en una página al azar mucho después).
+  const AUTO_ABRIR_VENTANA_MS = 12000;
+
+  // Pura y testeable: ¿la marca es un timestamp reciente y válido?
+  function autoAbrirEsFresca(ts, ahora) {
+    return typeof ts === "number" && (ahora - ts) >= 0 && (ahora - ts) < AUTO_ABRIR_VENTANA_MS;
+  }
+
+  // Marca que la próxima página que cargue debe abrir Iky sola, y luego ejecuta
+  // `despues` (navegamos ahí dentro para no descargar la página antes de guardar).
+  function marcarAutoAbrirIky(despues) {
+    try {
+      chrome.storage.local.set({ [AUTO_ABRIR_KEY]: Date.now() }, () => {
+        if (typeof despues === "function") despues();
+      });
+    } catch (e) {
+      // Sin chrome.storage: navegamos igual (Iky no se autoabrirá, pero no rompe).
+      if (typeof despues === "function") despues();
+    }
+  }
+
+  // Lee y consume (remueve) la bandera. Llama cb(true) solo si estaba fresca.
+  function consumirAutoAbrirIky(cb) {
+    try {
+      chrome.storage.local.get(AUTO_ABRIR_KEY, (res) => {
+        const ts = res && res[AUTO_ABRIR_KEY];
+        if (ts !== undefined) {
+          try { chrome.storage.local.remove(AUTO_ABRIR_KEY); } catch (e) {}
+        }
+        cb(autoAbrirEsFresca(ts, Date.now()));
+      });
+    } catch (e) {
+      cb(false);
+    }
+  }
+
   function confirmarAbrirResultado(resultado) {
     limpiarAccionesContextuales();
-    const abierto = abrirPrimerResultadoEnNuevaPestana(resultado && resultado.url);
-    if (abierto) {
-      agregarMensaje(
-        "Listo, lo abrí en otra pestaña."
-      );
-      // Silenciar ESTA pestaña (la original): el usuario probablemente se
-      // mueve a la nueva. Si Iky sigue escuchando aquí, contestaría junto
-      // con el Iky de la nueva pestaña. El usuario puede reactivar
-      // manualmente si quiere volver a usar Iky en esta pestaña.
-      silenciarEstaPestana();
-    } else {
-      agregarMensaje(
-        "No pude abrirlo. Haga clic en el título marcado."
-      );
+    const url = resultado && resultado.url;
+    if (!url || !/^https?:\/\//i.test(url)) {
+      agregarMensaje("No pude abrirlo. Haga clic en el título marcado.");
+      return;
     }
-  }
-
-  // Apaga voz (TTS) y mic (modo escucha) en esta pestaña, sin persistir
-  // las preferencias. Se invoca cuando Iky abre otra pestaña y conviene
-  // dejar callado al Iky de aquí para evitar respuestas duplicadas.
-  function silenciarEstaPestana() {
-    _silenciadoPorOrigen = true;
-    // NO cortamos el TTS en curso: el mensaje "Listo, abrí el primer
-    // resultado..." debe leerse completo. Solo apagamos para próximos
-    // mensajes.
-    if (vozActivada) {
-      vozActivada = false;
-      actualizarBotonVoz();
-    }
-    if (modoEscuchaActivado) {
-      // detenerModoEscucha cierra recognition + ventana conversacional
-      // y actualiza el botón. No toca la preferencia persistente.
-      detenerModoEscucha();
-    }
-  }
-
-  function abrirPrimerResultadoEnNuevaPestana(url) {
-    if (!url || !/^https?:\/\//i.test(url)) return false;
-    try {
-      // Usamos un <a> con target=_blank y .click() en vez de window.open()
-      // porque window.open(url, "_blank", "noopener,...") siempre devuelve
-      // null en Chrome cuando se incluye noopener (es por diseño: el
-      // opener pierde acceso a la nueva ventana). Eso hacía que reportáramos
-      // "no pude abrir" aunque la pestaña sí se abriera. Con un <a> simulado
-      // conservamos noopener/noreferrer y obtenemos un resultado confiable.
-      const a = document.createElement("a");
-      a.href = url;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      return true;
-    } catch (e) {
-      return false;
-    }
+    // Abrimos en ESTA pestaña. Marcamos la bandera para que Iky se abra solo al
+    // cargar la página de destino (cruza el cambio de origen) y navegamos dentro
+    // del callback, ya con la bandera guardada.
+    agregarMensaje("Listo. Le abro la página.");
+    marcarAutoAbrirIky(() => { window.location.assign(url); });
   }
 
   // ---- Respuesta conversacional a acción pendiente ----
@@ -2716,6 +2734,7 @@
     if (!texto) return;
     _perfTtsInicio = perfNow();
     perfLog("tts_inicio", { proveedorPreferido: "elevenlabs", textoLength: texto.length });
+    if (AG_DEBUG_TEXTO_VOZ) console.log("[Iky][voz] »", JSON.stringify(texto));
     _ttsBump({ solicitado: 1 });
     detenerLectura();
     const ok = await leerTextoElevenLabs(texto);
@@ -3038,6 +3057,12 @@
       ventanaConversacionTimer = null;
       actualizarEstadoMic();
     }, VENTANA_CONVERSACION_MS);
+    // Si tras CIERRE_MIC_MS no hubo un nuevo turno, apagamos el micrófono.
+    if (cierreMicTimer) clearTimeout(cierreMicTimer);
+    cierreMicTimer = setTimeout(() => {
+      cierreMicTimer = null;
+      if (modoEscuchaActivado) detenerModoEscucha();
+    }, CIERRE_MIC_MS);
   }
 
   function conversacionActiva() {
@@ -3049,6 +3074,10 @@
     if (ventanaConversacionTimer) {
       clearTimeout(ventanaConversacionTimer);
       ventanaConversacionTimer = null;
+    }
+    if (cierreMicTimer) {
+      clearTimeout(cierreMicTimer);
+      cierreMicTimer = null;
     }
     actualizarEstadoMic();
   }
@@ -3350,39 +3379,42 @@
   window.addEventListener("popstate", limpiarGuiasVisuales);
   window.addEventListener("hashchange", limpiarGuiasVisuales);
 
+  // Efectos de abrir el panel (foco, saludo hablado una vez, auto-encender modo
+  // escucha). El panel ya debe estar visible y chat.panelAbierto en true. Se
+  // reusa desde el handler de "Ayuda" y desde la auto-apertura tras abrir un
+  // resultado.
+  function aperturaPanel() {
+    input.focus();
+    // Saludo de bienvenida hablado: solo la primera vez que se abre el panel en
+    // esta carga, y solo si el usuario aún no tuvo respuestas.
+    if (vozActivada && speechDisponible()
+        && !saludoLeidoEnEstaSesion
+        && chat.mensajes.length === 0) {
+      saludoLeidoEnEstaSesion = true;
+      // En Google leemos el saludo de presentación con "Iqui" (pronunciación
+      // más natural que "Iky"). En página externa leemos el texto real del
+      // saludo (disclaimer normal, o aviso preventivo 2G si es sensible);
+      // no menciona el nombre del asistente.
+      leerTexto(esPaginaExterna() ? saludo.textContent : AG_SALUDO_TTS);
+    }
+    // Auto-encender modo escucha si el usuario lo dejó activo (es el default).
+    // iniciarModoEscucha NO corta el TTS — comenzarEscucharCiclo respeta
+    // estaLeyendo() y arranca el recognition cuando el saludo termine. Si el
+    // usuario lo apagó manualmente, la preferencia está en false y NO se enciende.
+    if (obtenerPreferenciaModoEscucha()
+        && reconocimientoVozDisponible()
+        && !modoEscuchaActivado) {
+      iniciarModoEscucha();
+    }
+  }
+
   // ---- Handlers ----
   boton.addEventListener("click", () => {
     panel.classList.toggle("ag-oculto");
     chat.panelAbierto = !panel.classList.contains("ag-oculto");
     guardarEstadoChat();
     if (chat.panelAbierto) {
-      input.focus();
-      // Saludo de bienvenida hablado: solo la primera vez que se abre el panel
-      // en esta carga, y solo si el usuario aún no tuvo respuestas. El click
-      // en "Ayuda" cuenta como gesto de usuario, así que el TTS no se bloquea.
-      if (vozActivada && speechDisponible()
-          && !saludoLeidoEnEstaSesion
-          && chat.mensajes.length === 0) {
-        saludoLeidoEnEstaSesion = true;
-        // En Google leemos el saludo de presentación con "Iqui" (pronunciación
-        // más natural que "Iky"). En página externa leemos el texto real del
-        // saludo (disclaimer normal, o aviso preventivo 2G si es sensible);
-        // no menciona el nombre del asistente.
-        leerTexto(esPaginaExterna() ? saludo.textContent : AG_SALUDO_TTS);
-      }
-      // Auto-encender modo escucha si el usuario lo dejó activo (es el
-      // default). iniciarModoEscucha NO corta el TTS — comenzarEscucharCiclo
-      // respeta estaLeyendo() y arranca el recognition cuando el saludo
-      // termine. Si el usuario lo apagó manualmente alguna vez, la
-      // preferencia está en false y NO se enciende. Si esta pestaña fue
-      // abierta por Iky (_silenciadoPorOrigen), tampoco se enciende — el
-      // usuario tiene que activar el modo escucha explícitamente.
-      if (obtenerPreferenciaModoEscucha()
-          && reconocimientoVozDisponible()
-          && !modoEscuchaActivado
-          && !_silenciadoPorOrigen) {
-        iniciarModoEscucha();
-      }
+      aperturaPanel();
     } else {
       // Panel cerrado: ningún micrófono ni TTS debe quedar activo a espaldas
       // del usuario. Apagamos cualquier captura/lectura en curso.
@@ -3401,6 +3433,149 @@
     }
   });
 
+  // HITO V1 — detector local de intención "repetir / simplificar"
+  function detectarMicroIntencionRepetir(textoNorm) {
+    const frases = [
+      "no entendi", "explicame de nuevo", "explicame denuevo",
+      "repitelo", "mas simple", "otra vez"
+    ];
+    return frases.some(f => textoNorm.includes(f));
+  }
+
+  async function manejarRepetirOSimplificar() {
+    if (esPaginaExterna()) {
+      _resetGuiaSiCambioUrl();
+      // Si hay una opción marcada, re-explicar ESA opción con otras palabras
+      // (vía Groq), sin mover el resaltado. Resuelve el caso visto en testing
+      // donde la persona no entendía qué hacer con lo marcado.
+      if (_guiaCandidatos.length > 0 && _guiaPos >= 0) {
+        const pagina = obtenerResumenCacheadoOFresco(false);
+        const cand = _guiaCandidatos[_guiaPos];
+        const info = (pagina.elementos && pagina.elementos[cand.idx]) || {};
+        const etiqueta = info.texto || info.ariaLabel || info.placeholder || "la opción que le marqué";
+        const pregunta = `En palabras simples y cortas, ¿qué es «${etiqueta}» y qué tengo que hacer? No invente.`;
+        const modo = actualizarModoSensible();
+        await consultarExplicarPagina(pregunta, {
+          pagina,
+          permitirResaltar: false,
+          seguridad: modo.esSensible ? modo : undefined,
+        });
+        return;
+      }
+      await responderPreguntaSobrePagina("Explíquelo de nuevo de forma más simple.");
+      return;
+    }
+    if (estaEnPaginaResultados()) {
+      ejecutarIntencion({ tipo: "EXPLICAR_RESULTADOS" });
+      return;
+    }
+    agregarMensaje("Se lo explico más simple. Dígame qué parte quiere revisar.");
+  }
+
+  // HITO V2 — detector local de intención "qué puedo hacer aquí"
+  function detectarMicroIntencionQueHago(textoNorm) {
+    const frases = [
+      "que puedo hacer aqui", "que hago aqui", "que hago ahora",
+      "que sigue", "que miro", "cual miro"
+    ];
+    return frases.some(f => textoNorm.includes(f));
+  }
+
+  async function manejarQueHagoAqui() {
+    if (!esPaginaExterna()) {
+      // Google: distinguir resultados vs home con el chequeo robusto existente.
+      if (estaEnPaginaResultados()) {
+        ejecutarIntencion({ tipo: "EXPLICAR_RESULTADOS" });
+      } else {
+        agregarMensaje("Dígame qué quiere buscar y le ayudo.");
+      }
+      return;
+    }
+    // Página externa: reutilizar el modo sensible ya cacheado por urlKey.
+    const modo = actualizarModoSensible();
+    if (modo.esSensible) {
+      agregarMensaje("Puedo explicarle esta página. Por el momento no puedo hacer pagos ni ingresar claves.");
+      return;
+    }
+    await responderPreguntaSobrePagina("¿Qué puede hacer el usuario en esta página?");
+  }
+
+  // HITO V3 — detector local de "otra opción / otro resultado". No matchea
+  // "no" a secas, "otra vez" (V1) ni "que sigue" (V2).
+  function detectarMicroIntencionOtraOpcion(textoNorm) {
+    if (!textoNorm) return false;
+    return /\botro\b|otra opcion|\bsiguiente\b|no es ese|no es esa|no era ese|no era esa|\bese no\b|\besa no\b|mas abajo|mas arriba/.test(textoNorm);
+  }
+
+  // Marca otra alternativa visible SIN clic ni navegación. Consume (true) solo
+  // si hay algo que ciclar; si no, devuelve false para que el flujo normal
+  // (sí/no, backend) siga su curso.
+  async function manejarOtraOpcion(texto) {
+    if (!esPaginaExterna()) {
+      if (!estaEnPaginaResultados()) return false; // Google home → no consume
+      return marcarSiguienteResultadoGoogle();
+    }
+    // Página externa: reutilizar la corrección 2F. Resetear si cambió la URL
+    // para no reciclar candidatos de otra página.
+    _resetGuiaSiCambioUrl();
+    if (_guiaCandidatos.length === 0) return false; // sin guía activa → no consume
+    const norm = normalizar(texto);
+    // Caso mixto ("no es ese, el de devoluciones"): si la corrección trae
+    // contenido semántico, dejamos que Groq elija la sección en vez de ciclar.
+    if (tieneContenidoExtraEnCorreccion(norm)) {
+      return await localizarSeccionConGroq(texto);
+    }
+    await manejarCorreccionGuia(esCorreccionGuia(norm) || "siguiente", texto);
+    return true;
+  }
+
+  // Marca el siguiente resultado de Google y re-apunta la acción de abrir a ESE
+  // resultado (para que un posterior "ábrelo" abra el nuevo). Nunca abre.
+  function marcarSiguienteResultadoGoogle() {
+    const siguiente = indiceResultadoGoogleMarcado + 1;
+    const r = encontrarResultadoGooglePorIndice(siguiente);
+    if (!r) {
+      agregarMensaje("No veo otro resultado claro.");
+      return true;
+    }
+    indiceResultadoGoogleMarcado = siguiente;
+    agregarMensaje("Le marqué otro resultado.");
+    resaltar(r.contenedor);
+    mostrarAccionAbrirPrimerResultado(r);
+    return true;
+  }
+
+  // Heurística: ¿quedan palabras de contenido tras quitar las muletillas de
+  // corrección? ("no es ese" → no; "no es ese, el de devoluciones" → sí).
+  function tieneContenidoExtraEnCorreccion(textoNorm) {
+    const muletillas = /\b(otro|otra|opcion|siguiente|el|la|los|las|no|es|esa|ese|era|mas|menos|abajo|arriba|derecha|izquierda|equivocad\w*|por|favor|porfa|quiero|elegir|muestrame|resultado)\b/g;
+    const restante = textoNorm.replace(muletillas, " ").replace(/\s+/g, " ").trim();
+    return restante.split(" ").some((w) => w.length >= 4);
+  }
+
+  // Pasa la frase completa + los candidatos top-5 a Groq para que localice la
+  // sección correcta. En sensible no se permite resaltar (idx forzado a null).
+  async function localizarSeccionConGroq(texto) {
+    const pagina = obtenerResumenCacheadoOFresco(false);
+    const modo = actualizarModoSensible();
+    const candidatos = _guiaCandidatos.map((c) => {
+      const el = (pagina.elementos && pagina.elementos[c.idx]) || {};
+      return {
+        idx: c.idx,
+        texto: el.texto || el.ariaLabel || el.placeholder || null,
+        razon: c.razon,
+        score: c.score,
+      };
+    });
+    await consultarExplicarPagina(texto, {
+      pagina,
+      candidatos,
+      permitirResaltar: !modo.esSensible,
+      seguridad: modo.esSensible ? modo : undefined,
+    });
+    return true;
+  }
+
   async function manejarPregunta() {
     const texto = input.value;
     // Limpiamos el input antes del await para dar feedback inmediato y no
@@ -3417,20 +3592,44 @@
       esPaginaExterna: esPaginaExterna(),
       modoSensible: modoPaginaSensible.esSensible,
     });
-    // Conversacional primero: si el usuario dijo "sí"/"no"/"búscalo"/etc
-    // y hay una acción pendiente, avanzamos sin llamar backend. También
-    // atajamos "sí"/"no" sueltos sin contexto para no confundir a la IA.
+    const _norm = normalizar(texto);
+    // Guardrail temprano: si el texto trae términos sensibles (dinero,
+    // claves, etc.), bloqueamos antes de cualquier otra acción. Va arriba del
+    // todo para que ni el ciclado ni la re-explicación pasen por encima. El
+    // backend safety-rules sigue siendo segunda capa.
+    if (clasificarRiesgoTexto(texto) === "ALTO") {
+      perfLog("pregunta_bloqueada_local", { duracionMs: perfDuracion(_perfPreguntaInicio) });
+      agregarMensaje(RESPUESTA_FUERA_DE_ALCANCE_LOCAL);
+      input.focus();
+      return;
+    }
+    // HITO V3 — "otra opción / otro resultado". ANTES del manejador sí/no
+    // porque "no es ese" se clasificaría como rechazo; solo consume si hay algo
+    // que ciclar (resultados Google o guía local activa). "no" a secas no
+    // matchea, así que sigue cancelando más abajo.
+    if (detectarMicroIntencionOtraOpcion(_norm)) {
+      if (await manejarOtraOpcion(texto)) {
+        input.focus();
+        return;
+      }
+    }
+    // HITO V1 — repetir / re-explicar. También antes del sí/no: "no entendí"
+    // contiene "no" y, si quedara después, se leería como rechazo.
+    if (detectarMicroIntencionRepetir(_norm)) {
+      await manejarRepetirOSimplificar();
+      input.focus();
+      return;
+    }
+    // Conversacional: si el usuario dijo "sí"/"no"/"búscalo"/etc y hay una
+    // acción pendiente, avanzamos sin llamar backend. También atajamos
+    // "sí"/"no" sueltos sin contexto para no confundir a la IA.
     if (manejarRespuestaAAccionPendiente(texto)) {
       input.focus();
       return;
     }
-    // Guardrail temprano: si el texto trae términos sensibles (dinero,
-    // claves, etc.), bloqueamos antes de llamar al backend. Evita gastar
-    // cuota del modelo en frases que nunca se ejecutarían. El backend
-    // safety-rules sigue siendo segunda capa.
-    if (clasificarRiesgoTexto(texto) === "ALTO") {
-      perfLog("pregunta_bloqueada_local", { duracionMs: perfDuracion(_perfPreguntaInicio) });
-      agregarMensaje(RESPUESTA_FUERA_DE_ALCANCE_LOCAL);
+    // HITO V2 — "qué puedo hacer aquí": orientar según contexto, sin /interpretar.
+    if (detectarMicroIntencionQueHago(_norm)) {
+      await manejarQueHagoAqui();
       input.focus();
       return;
     }
@@ -3553,9 +3752,33 @@
     if (chat.panelAbierto
         && obtenerPreferenciaModoEscucha()
         && reconocimientoVozDisponible()
-        && !modoEscuchaActivado
-        && !_silenciadoPorOrigen) {
+        && !modoEscuchaActivado) {
       iniciarModoEscucha();
     }
+
+    // Si veníamos de una búsqueda iniciada por Iky y el modo escucha quedó
+    // activo, reabrimos la ventana conversacional: el usuario puede seguir sin
+    // repetir "Iky" y reinicia los timers (ventana 15s + cierre de mic 20s).
+    if (estadoPrevio.busquedaEnCurso && modoEscuchaActivado) {
+      activarVentanaConversacion();
+      actualizarEstadoMic();
+    }
   }
+
+  // Si Iky abrió esta página desde un resultado (misma pestaña, otro origen),
+  // la bandera global pide abrir el panel solo. Es async (chrome.storage), así
+  // que corre después de la restauración síncrona de arriba.
+  consumirAutoAbrirIky((debe) => {
+    if (!debe || chat.panelAbierto) return;
+    panel.classList.remove("ag-oculto");
+    chat.panelAbierto = true;
+    guardarEstadoChat();
+    aperturaPanel();
+    // Igual que tras una búsqueda: abrimos la ventana conversacional para que el
+    // usuario interactúe al llegar sin tener que repetir "Iky" (timers 15s/20s).
+    if (modoEscuchaActivado) {
+      activarVentanaConversacion();
+      actualizarEstadoMic();
+    }
+  });
 })();

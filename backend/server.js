@@ -26,6 +26,25 @@ function perfLogBackend(evento, data) {
   console.log("[Iky][perf]", evento, JSON.stringify(data || {}));
 }
 
+// En un 429, Groq manda en headers/cuerpo CUÁL límite se topó (requests vs
+// tokens, por minuto vs diario) y el retry-after. Lo logueamos para medir el
+// cuello real antes de optimizar. Solo metadata de rate-limit + el mensaje del
+// proveedor: nada de texto de usuario, página ni claves (misma barra que perf).
+function logRateLimit(endpoint, err) {
+  const h = (err && err.headers) || {};
+  const get = (k) => (typeof h.get === "function" ? h.get(k) : h[k]) || null;
+  console.warn("[Iky][429]", endpoint, JSON.stringify({
+    retryAfter: get("retry-after"),
+    limitRequests: get("x-ratelimit-limit-requests"),
+    remainingRequests: get("x-ratelimit-remaining-requests"),
+    resetRequests: get("x-ratelimit-reset-requests"),
+    limitTokens: get("x-ratelimit-limit-tokens"),
+    remainingTokens: get("x-ratelimit-remaining-tokens"),
+    resetTokens: get("x-ratelimit-reset-tokens"),
+    mensaje: (err && err.error && err.error.message) || (err && err.message) || null,
+  }));
+}
+
 const TIPOS_PERMITIDOS = new Set([
   "RESALTAR_BARRA",
   "GUIAR_BUSQUEDA",
@@ -171,6 +190,14 @@ const RESPUESTA_FUERA_DE_ALCANCE = {
 const ELEVENLABS_TIMEOUT_MS = 5000;
 const TTS_MAX_CHARS = 600;
 const TTS_DEFAULT_MODEL = "eleven_multilingual_v2";
+// Velocidad de la voz (0.7 lento – 1.2 rápido; 1.0 = normal de ElevenLabs).
+// Más lento ayuda a que un adulto mayor alcance a entender. Configurable por
+// .env (ELEVENLABS_SPEED) para afinar de oído sin tocar código.
+const TTS_SPEED = (() => {
+  const v = parseFloat(process.env.ELEVENLABS_SPEED);
+  if (!Number.isFinite(v)) return 0.9;
+  return Math.min(1.2, Math.max(0.7, v));
+})();
 
 // Configuración del chat de página externa. El payload del cliente trae
 // un resumen estructurado del DOM (no HTML literal). El cap del body
@@ -438,7 +465,7 @@ app.post("/interpretar", async (req, res) => {
     perfLogBackend("request_fin", { endpoint: "/interpretar", duracionMs: Date.now() - _tReq, ok: false, provider: "groq", status: err?.status || null });
     // Groq SDK expone .status estilo OpenAI (429 = rate limit, 5xx = server).
     if (err?.status === 429) {
-      console.warn("/interpretar: rate limit");
+      logRateLimit("/interpretar", err);
       return res.status(429).json({ error: "Rate limit." });
     }
     console.error("/interpretar error:", err?.message || err);
@@ -480,7 +507,9 @@ app.post("/tts", async (req, res) => {
           "Content-Type": "application/json",
           "Accept": "audio/mpeg",
         },
-        body: JSON.stringify({ text: limpio, model_id: modelId }),
+        // Solo enviamos `speed`; los demás voice_settings caen a los de la voz
+        // configurada, así no alteramos su timbre cálido (multilingual_v2).
+        body: JSON.stringify({ text: limpio, model_id: modelId, voice_settings: { speed: TTS_SPEED } }),
         signal: controller.signal,
       }
     );
@@ -749,7 +778,7 @@ async function explicarPaginaHandler(req, res) {
   } catch (err) {
     perfLogBackend("request_fin", { endpoint: "/explicar-pagina", duracionMs: Date.now() - _tReq, ok: false, provider: "groq", status: err?.status || null });
     if (err?.status === 429) {
-      console.warn("/explicar-pagina: rate limit");
+      logRateLimit("/explicar-pagina", err);
       return res.status(429).json({ error: "Rate limit." });
     }
     console.error("/explicar-pagina error:", err?.message || err);
